@@ -187,6 +187,57 @@ def generate(base_ppt_bytes: bytes,
 - `inserted_hymns`: 삽입된 성가 정보 (번호, 위치, 슬라이드 수)
 - `warnings`: 주의사항 (없는 이미지, 배치 변경 등)
 
+## 3단계: Streamlit 웹앱
+
+### 저장소 인터페이스 (mass_ppt/storage.py)
+- **abstract base class**: `Storage` (로컬/GitHub 등 다양한 구현체를 위해)
+- **LocalStorage 구현**:
+  - `list_archive()`: 최종본 PPT 목록 (날짜순 역순)
+  - `get_latest_archive()`: 가장 최근 최종본
+  - `read_archive(filename)`: 최종본 읽기
+  - `save_archive(filename, ppt_bytes, uploader)`: 최종본 저장
+  - `delete_archive(filename)`: 최종본 삭제
+  - `list_songs()`: 성가 이미지 목록
+  - `read_song(hymn_num, page)`: 성가 이미지 읽기
+  - `get_hymn_image_getter()`: generate.py용 getter 함수
+
+### 파일명 규칙 검증
+- PPT: `YYMMDD미사.pptx` (예: 261017미사.pptx)
+- 성가: `{번호}.png/jpg` 또는 `{번호}-{장}.png/jpg`
+
+### Streamlit 앱 (app.py)
+
+**페이지 1: PPT 만들기**
+1. 기준 PPT 선택 (드롭다운, 기본값: 최신)
+2. 매일미사 URL 입력 → [불러오기]
+3. 파싱 결과 수정 (텍스트 인풋/에리어):
+   - 표지 제목, 날짜
+   - 제1~2독서 출처
+   - 화답송, 복음환호송, 복음
+   - 영성체송
+4. 성가 번호 입력 (입당, 봉헌, 성체 1~2, 파견)
+   - 입력 시 즉시 ✅/❌ 표시 및 썸네일
+5. [PPT 생성] → 다운로드
+6. 생성 보고서 (변경 텍스트, 경고)
+
+**페이지 2: 최종본 올리기**
+1. PPT 업로드 → 자동 검증
+2. 표지 날짜 자동 인식 → 파일명 제안
+3. 파일명 수정 가능 (규칙 검증)
+4. 올린 사람 이름 (선택 입력)
+5. 같은 날짜 파일 있으면 확인 요청
+6. 최근 최종본 목록 (다운로드 버튼)
+
+**페이지 3: 성가 관리**
+- 현재: 저장된 성가 목록만 표시 (4단계에서 기능 추가)
+
+### 구현 특징
+- **모바일 대응**: `layout="centered"`, 좁은 화면 고려
+- **한국어 UI**: 모든 메시지 및 안내 한국어
+- **세션 상태**: `st.session_state` 사용으로 사용자별 격리
+- **예외 처리**: 모든 에러를 한국어로 표시
+- **메모리 처리**: 생성 파일은 메모리(BytesIO)에만 보관
+
 ## Git 커밋 규칙
 - Co-Author 포함: `Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>`
 - 명확한 메시지: 무엇(what)보다는 왜(why) 중심
