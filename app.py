@@ -2,22 +2,22 @@
 개포동성당 초등부 미사 PPT 자동 생성 웹앱.
 Streamlit 기반, 비개발자(교사) 친화적 UI.
 """
-import streamlit as st
-from pathlib import Path
 import io
-from datetime import datetime, timedelta
+import re
+from pathlib import Path
+
+import streamlit as st
 from PIL import Image
-import zipfile
 
-from mass_ppt.parser import parse_mass_url
-from mass_ppt.text_edit import update_ppt
-from mass_ppt.generate import generate_from_local_hymns
-from mass_ppt.storage import LocalStorage, GitHubStorage, Storage
-from mass_ppt.hymns import _find_hymn_slides
-from lxml import etree
+from mass_ppt.generate import generate
+from mass_ppt.hymns import HymnTemplateError, find_hymn_bundles
+from mass_ppt.parser import FIELD_KEYS, ParseError, parse_mass_url
+from mass_ppt.pptx_package import NS, Package
+from mass_ppt.storage import GitHubStorage, LocalStorage, Storage
+from mass_ppt.text_edit import DATE_RE, find_text_slides
 
+PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
-# 설정
 st.set_page_config(
     page_title="개포동성당 초등부 미사 PPT",
     page_icon="⛪",
@@ -25,398 +25,254 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# 스타일
 st.markdown("""
 <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-    .stButton > button { width: 100%; }
-    .success { color: green; }
-    .error { color: red; }
-    .warning { color: orange; }
-    .preview-img { max-width: 200px; border-radius: 4px; }
-    input[type="text"], textarea { font-family: 'Courier New', monospace; }
+    .stButton > button, .stDownloadButton > button { width: 100%; }
 </style>
 """, unsafe_allow_html=True)
 
-# 저장소 초기화
+
 @st.cache_resource
 def get_storage() -> Storage:
     """GitHub 설정이 있으면 GitHubStorage, 없으면 LocalStorage 사용."""
     try:
-        # Streamlit secrets에서 GitHub 설정 읽기
-        if hasattr(st, 'secrets') and 'GITHUB_TOKEN' in st.secrets:
-            token = st.secrets.get('GITHUB_TOKEN')
-            repo = st.secrets.get('GITHUB_REPO', 'cmkkj0831-hub/gaepochurch_ppt')
-            branch = st.secrets.get('GITHUB_BRANCH', 'main')
-
-            if token:
-                return GitHubStorage(token, repo, branch)
+        if 'GITHUB_TOKEN' in st.secrets and st.secrets.get('GITHUB_TOKEN'):
+            return GitHubStorage(
+                st.secrets['GITHUB_TOKEN'],
+                st.secrets.get('GITHUB_REPO', 'cmkkj0831-hub/gaepochurch_ppt'),
+                st.secrets.get('GITHUB_BRANCH', 'main'),
+            )
     except Exception:
         pass
-
-    # 기본값: LocalStorage
     return LocalStorage()
+
 
 storage = get_storage()
 
+EDIT_FIELDS = [
+    ('cover_title', '표지 제목', '예: 연중 제 29 주일(전교 주일)', False),
+    ('cover_date', '표지 날짜 (토요일)', '예: 2026.10.17', False),
+    ('first_reading_intro', '제1독서 출처 문장', '예: ▥ 이사야서의 말씀입니다.', False),
+    ('first_reading_ref', '제1독서 장절', '예: 2,1-5', False),
+    ('psalm_refrain', '화답송 후렴', '예: ◎ 주님은 민족들의 눈앞에 당신 정의를 드러내셨네.', True),
+    ('second_reading_intro', '제2독서 출처 문장', '예: ▥ 사도 바오로의 로마서 말씀입니다.', False),
+    ('second_reading_ref', '제2독서 장절', '예: 10,9-18', False),
+    ('gospel_acclamation', '복음 환호송 구절', '예: ○ 주님이 말씀하신다. …', True),
+    ('gospel_intro', '복음 출처 문장', '예: ✠ 마태오가 전한 거룩한 복음입니다.', False),
+    ('gospel_ref', '복음 장절', '예: 28,16-20', False),
+    ('communion_antiphon', '영성체송', '영성체송 본문', True),
+]
 
-def extract_date_from_ppt(ppt_bytes: bytes) -> str:
-    """PPT 표지 슬라이드에서 날짜 추출 (YYYY.MM.DD)."""
+HYMN_INPUTS = [
+    ('entrance', '입당 성가'),
+    ('offertory', '봉헌 성가'),
+    ('communion1', '성체 성가 1'),
+    ('communion2', '성체 성가 2 (없으면 비워두기)'),
+    ('recessional', '파견 성가'),
+]
+
+
+def cover_date_of(ppt_bytes: bytes) -> str:
+    """첫 슬라이드에서 YYYY.MM.DD 날짜를 찾는다."""
     try:
-        with zipfile.ZipFile(io.BytesIO(ppt_bytes)) as z:
-            slide1 = z.read('ppt/slides/slide1.xml')
-
-        tree = etree.fromstring(slide1)
-        namespaces = {
-            'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
-            'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
-        }
-
-        # 날짜 형식 찾기 (YYYY.MM.DD)
-        for t in tree.findall('.//a:t', namespaces):
-            if t.text and '.' in t.text:
-                parts = t.text.split('.')
-                if len(parts) == 3 and all(p.isdigit() for p in parts):
-                    return t.text
+        pkg = Package(ppt_bytes)
+        root = pkg.xml(pkg.slide_parts()[0])
+        for t in root.iter('{%s}t' % NS['a']):
+            if t.text and DATE_RE.match(t.text.strip()):
+                return t.text.strip()
     except Exception:
         pass
-
     return ""
 
 
-def validate_ppt(ppt_bytes: bytes) -> tuple[bool, str]:
-    """PPT 유효성 검증."""
-    try:
-        # PPTX 형식 확인
-        with zipfile.ZipFile(io.BytesIO(ppt_bytes)) as z:
-            # 필수 파일 확인
-            z.getinfo('ppt/presentation.xml')
+def check_template(ppt_bytes: bytes) -> list:
+    """다음 주 자동 생성에 필요한 구조 점검. 문제 목록을 반환."""
+    problems = []
+    pkg = Package(ppt_bytes)
+    bundles = find_hymn_bundles(pkg)
+    if len(bundles) != 4:
+        problems.append(f"성가 번호 슬라이드 묶음이 {len(bundles)}개입니다 (4개여야 함).")
+    for title, nums in find_text_slides(pkg).items():
+        if len(nums) != 1:
+            problems.append(f'"{title}" 슬라이드가 {len(nums)}개입니다 (1개여야 함).')
+    if not cover_date_of(ppt_bytes):
+        problems.append("표지에서 날짜(예: 2026.10.17)를 찾지 못했습니다.")
+    return problems
 
-            # 슬라이드 확인
-            slide_files = z.namelist()
-            if not any(f.startswith('ppt/slides/slide') for f in slide_files):
-                return False, "슬라이드가 없습니다"
 
-        return True, "유효한 PPT입니다"
-    except Exception as e:
-        return False, f"PPT 읽기 실패: {str(e)}"
+def filename_from_cover_date(cover_date: str) -> str:
+    m = re.fullmatch(r'\d{2}(\d{2})\.(\d{2})\.(\d{2})', (cover_date or '').strip())
+    return f"{m.group(1)}{m.group(2)}{m.group(3)}미사.pptx" if m else ""
+
+
+def hymn_numbers_from_state() -> dict:
+    def num(key):
+        v = (st.session_state.get(f"hymn_{key}") or "").strip()
+        return int(v) if v.isdigit() and int(v) > 0 else None
+
+    return {
+        'entrance': num('entrance'),
+        'offertory': num('offertory'),
+        'communion': [n for n in (num('communion1'), num('communion2')) if n],
+        'recessional': num('recessional'),
+    }
 
 
 def page_create_ppt():
-    """페이지 1: PPT 만들기."""
     st.header("📝 PPT 만들기", divider="blue")
 
-    # 기준 PPT 선택
-    st.subheader("1️⃣ 기준 PPT 선택")
-
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        archive_files = storage.list_archive()
-        if archive_files:
-            file_options = [f"{f.name} ({f.modified_time.strftime('%m월 %d일')})" for f in archive_files]
-            selected_idx = st.selectbox(
-                "기준 PPT",
-                range(len(file_options)),
-                format_func=lambda i: file_options[i],
-                label_visibility="collapsed"
-            )
-            base_filename = archive_files[selected_idx].name
-            st.caption(f"기준: {base_filename}")
-        else:
-            st.error("저장된 PPT가 없습니다")
-            return
-
-    with col2:
-        if st.button("📂 직접 업로드"):
-            uploaded_file = st.file_uploader("PPT 선택", type=["pptx"], key="base_upload")
-            if uploaded_file:
-                st.session_state.custom_base_ppt = uploaded_file.read()
-                st.success("업로드됨")
-
-    # 기준 PPT 결정
-    if 'custom_base_ppt' in st.session_state:
-        base_ppt_bytes = st.session_state.custom_base_ppt
-        st.info("📂 업로드된 PPT를 사용합니다")
+    st.subheader("1. 기준 PPT")
+    archive_files = storage.list_archive()
+    base_ppt_bytes, base_label = None, ""
+    use_upload = st.checkbox("다른 PPT 파일을 직접 올려서 기준으로 쓰기")
+    if use_upload:
+        up = st.file_uploader("기준 PPT 파일", type=["pptx"], key="base_upload")
+        if up:
+            base_ppt_bytes, base_label = up.getvalue(), up.name
+    elif archive_files:
+        names = [f.name for f in archive_files]
+        base_label = st.selectbox("기준 최종본 (기본: 가장 최근)", names, index=0)
+        base_ppt_bytes = storage.read_archive(base_label)
     else:
-        base_ppt_bytes = storage.read_archive(base_filename)
+        st.error("저장된 최종본이 없습니다. 위 체크박스로 기준 PPT를 직접 올려주세요.")
+    if base_label:
+        st.caption(f"기준: {base_label}")
 
-    # 매일미사 URL 입력
-    st.subheader("2️⃣ 매일미사 정보")
+    st.subheader("2. 매일미사 불러오기")
+    url = st.text_input("매일미사 URL", placeholder="https://maria.catholic.or.kr/mi_pr/missa/missa.asp?...")
+    if st.button("🔄 불러오기", disabled=not url):
+        with st.spinner("매일미사 페이지를 읽는 중..."):
+            try:
+                parsed = parse_mass_url(url)
+                for key in FIELD_KEYS:
+                    st.session_state[f"f_{key}"] = parsed.get(key) or ""
+                st.session_state.parse_missing = [k for k, *_ in EDIT_FIELDS if not parsed.get(k)]
+                st.session_state.pop('generated_ppt', None)
+                st.success("불러왔습니다. 아래 내용을 확인해 주세요.")
+            except ParseError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"매일미사 페이지를 읽는 중 문제가 생겼습니다: {e}")
 
-    url = st.text_input(
-        "매일미사 URL",
-        placeholder="https://maria.catholic.or.kr/mi_pr/missa/...",
-        help="매일미사 웹사이트의 미사 정보 페이지 URL"
-    )
+    st.subheader("3. 내용 확인·수정")
+    st.caption("PPT는 아래 칸의 값으로만 만들어집니다. 틀린 곳은 직접 고쳐주세요.")
+    missing = set(st.session_state.get('parse_missing', []))
+    for key, label, placeholder, long in EDIT_FIELDS:
+        if key in missing:
+            st.error(f"⚠️ {label}: 페이지에서 찾지 못했습니다. 직접 입력해 주세요.")
+        widget = st.text_area if long else st.text_input
+        widget(label, key=f"f_{key}", placeholder=placeholder)
 
-    parsed = None
-    if url:
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.text_input("URL 상태", "✅ 입력됨", disabled=True)
-        with col2:
-            if st.button("🔄 불러오기", use_container_width=True):
-                with st.spinner("파싱 중..."):
-                    try:
-                        parsed = parse_mass_url(url)
-                        st.session_state.parsed = parsed
-                        st.success("✅ 파싱 완료")
-                    except Exception as e:
-                        st.error(f"❌ 파싱 실패: {str(e)}")
+    st.subheader("4. 성가 번호")
+    for key, label in HYMN_INPUTS:
+        st.text_input(label, key=f"hymn_{key}", placeholder="번호만 입력 (예: 58)")
+        raw = (st.session_state.get(f"hymn_{key}") or "").strip()
+        if not raw:
+            continue
+        if not raw.isdigit():
+            st.error(f"❌ '{raw}'는 숫자가 아닙니다.")
+            continue
+        try:
+            files = storage.hymn_files(int(raw))
+        except Exception as e:
+            st.error(f"성가 목록을 읽지 못했습니다: {e}")
+            continue
+        if files:
+            st.markdown(f"**{raw}번 ✅ {len(files)}장**")
+            with st.expander(f"{raw}번 악보 보기"):
+                for name in files:
+                    data = storage.read_song_file(name)
+                    if data:
+                        st.image(Image.open(io.BytesIO(data)), caption=name, width=240)
+        else:
+            st.markdown(f"**{raw}번 ❌ 이미지 없음** — 이 성가는 PPT에 들어가지 않습니다.")
 
-    # 파싱 결과 수정
-    if 'parsed' in st.session_state:
-        parsed = st.session_state.parsed
-        st.subheader("3️⃣ 전례 정보 수정")
+    st.subheader("5. PPT 만들기")
+    if st.button("🚀 PPT 생성", type="primary", disabled=base_ppt_bytes is None):
+        fields = {key: (st.session_state.get(f"f_{key}") or "").strip() or None for key in FIELD_KEYS}
+        with st.spinner("PPT를 만드는 중..."):
+            try:
+                result, report = generate(base_ppt_bytes, fields, hymn_numbers_from_state(),
+                                          storage.get_hymn_images)
+                name = filename_from_cover_date(fields.get('cover_date')) or "미사.pptx"
+                st.session_state.generated_ppt = (name, result, report)
+            except HymnTemplateError as e:
+                st.error(f"기준 PPT 구조 문제로 만들 수 없습니다: {e}")
+            except Exception as e:
+                st.error(f"PPT를 만드는 중 문제가 생겼습니다: {e}")
 
-        col1, col2 = st.columns(2)
-
-        with col1:
-            parsed['liturgy_title'] = st.text_input(
-                "전례일 제목",
-                value=parsed.get('liturgy_title') or "",
-                placeholder="예: (녹) 연중 제29주일(전교 주일)"
-            )
-
-            parsed['first_reading_ref'] = st.text_input(
-                "제1독서 장절",
-                value=parsed.get('first_reading_ref') or "",
-                placeholder="예: 2,1-5"
-            )
-
-            parsed['second_reading_ref'] = st.text_input(
-                "제2독서 장절",
-                value=parsed.get('second_reading_ref') or "",
-                placeholder="예: 10,9-18"
-            )
-
-        with col2:
-            date_val = st.text_input(
-                "표지 날짜",
-                value=parsed.get('date') or "",
-                placeholder="YYYY-MM-DD (일요일)",
-                help="일요일 날짜. 자동으로 토요일로 변환됩니다"
-            )
-            if date_val:
-                parsed['date'] = date_val
-
-            parsed['responsorial_refrain'] = st.text_area(
-                "화답송 후렴",
-                value=parsed.get('responsorial_refrain') or "",
-                height=60,
-                placeholder="예: ◎ 주님은 민족들의 눈앞에..."
-            )
-
-            parsed['gospel_ref'] = st.text_input(
-                "복음 장절",
-                value=parsed.get('gospel_ref') or "",
-                placeholder="예: 28,16-20"
-            )
-
-        st.session_state.parsed = parsed
-
-        # 성가 번호 입력
-        st.subheader("4️⃣ 성가 번호")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            entrance = st.number_input("입당", min_value=0, value=0, step=1)
-            offertory = st.number_input("봉헌", min_value=0, value=0, step=1)
-
-        with col2:
-            communion1 = st.number_input("성체 1", min_value=0, value=0, step=1)
-            communion2 = st.number_input("성체 2", min_value=0, value=0, step=1, help="(선택)")
-
-        recessional = st.number_input("파견", min_value=0, value=0, step=1)
-
-        # 성가 번호 검증
-        hymn_numbers = {
-            'entrance': entrance,
-            'offertory': offertory,
-            'communion': [communion1] + ([communion2] if communion2 > 0 else []),
-            'recessional': recessional
-        }
-
-        hymn_cols = st.columns(len([h for h in [entrance, offertory, communion1, communion2, recessional] if h > 0]))
-        for col, hymn in zip(hymn_cols, [entrance, offertory, communion1, communion2, recessional]):
-            if hymn > 0:
-                img = storage.read_song(hymn)
-                with col:
-                    if img:
-                        st.image(Image.open(io.BytesIO(img)), width=80, caption=f"{hymn}")
-                        st.caption("✅", unsafe_allow_html=True)
-                    else:
-                        st.warning(f"{hymn}\n❌", unsafe_allow_html=True)
-
-        # PPT 생성
-        st.subheader("5️⃣ PPT 생성")
-
-        if st.button("🚀 PPT 생성", use_container_width=True, type="primary"):
-            with st.spinner("생성 중..."):
-                try:
-                    result_bytes, report = generate_from_local_hymns(
-                        base_ppt_bytes,
-                        url,
-                        hymn_numbers
-                    )
-
-                    # 다운로드 파일명 (토요일 기준)
-                    date_parts = parsed.get('date', '').split('-')
-                    if len(date_parts) == 3:
-                        from datetime import datetime, timedelta
-                        sunday = datetime.strptime(parsed['date'], '%Y-%m-%d')
-                        saturday = sunday - timedelta(days=1)
-                        filename = saturday.strftime('%y%m%d') + '미사.pptx'
-                    else:
-                        filename = 'generated.pptx'
-
-                    st.session_state.generated_ppt = (filename, result_bytes)
-                    st.success("✅ PPT 생성 완료")
-
-                    # 보고서
-                    with st.expander("📋 생성 보고서"):
-                        st.write("**변경된 텍스트**")
-                        for text in report['updated_texts']:
-                            st.caption(f"  • {text}")
-
-                        if report['warnings']:
-                            st.warning("**⚠️ 경고**")
-                            for warn in report['warnings']:
-                                st.caption(f"  • {warn}")
-
-                except Exception as e:
-                    st.error(f"❌ 생성 실패: {str(e)}")
-
-        # 다운로드
-        if 'generated_ppt' in st.session_state:
-            filename, ppt_bytes = st.session_state.generated_ppt
-            st.download_button(
-                label="📥 PPT 다운로드",
-                data=ppt_bytes,
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                use_container_width=True
-            )
-
-            st.info("💡 **다음 단계**: 다운로드한 파일을 필요에 따라 다듬은 뒤 '최종본 올리기' 탭에서 올려주세요. 이 파일이 다음 주 PPT의 기준이 됩니다.")
+    generated = st.session_state.get('generated_ppt')
+    if generated:
+        name, data, report = generated
+        st.success(f"완성! 슬라이드 {report.get('slide_count')}장")
+        st.download_button("📥 " + name + " 다운로드", data=data, file_name=name, mime=PPTX_MIME)
+        with st.expander("생성 내용 요약", expanded=True):
+            for h in report.get('hymns') or []:
+                st.write(f"• {h['role']} {h['num']}번 ({h['pages']}장)")
+            for c in report.get('changed_texts') or []:
+                st.write(f"• {c['field']}: {c['after'].strip()}")
+            for w in report.get('warnings') or []:
+                st.warning(w)
+        st.info("다운로드한 파일을 다듬은 뒤 '최종본 올리기'에 꼭 올려주세요. 다음 주 PPT의 기준이 됩니다.")
 
 
 def page_upload_archive():
-    """페이지 2: 최종본 올리기."""
     st.header("📤 최종본 올리기", divider="blue")
 
-    # 파일 업로드
-    st.subheader("최종본 PPT 업로드")
-
-    uploaded_file = st.file_uploader(
-        "PPT 파일 선택",
-        type=["pptx"],
-        help="다듬은 최종본 PPT를 올려주세요"
-    )
-
-    if uploaded_file:
-        ppt_bytes = uploaded_file.read()
-
-        # 유효성 검증
-        valid, msg = validate_ppt(ppt_bytes)
-        if not valid:
-            st.error(f"❌ {msg}")
+    uploaded = st.file_uploader("다듬은 최종본 PPT", type=["pptx"], key="archive_upload")
+    if uploaded:
+        ppt_bytes = uploaded.getvalue()
+        try:
+            problems = check_template(ppt_bytes)
+        except Exception:
+            st.error("PPT 파일을 열 수 없습니다. 올바른 .pptx 파일인지 확인해 주세요.")
             return
-
-        st.success("✅ 유효한 PPT입니다")
-
-        # 파일명 제안
-        date_str = extract_date_from_ppt(ppt_bytes)
-
-        if date_str:
-            # YYYY.MM.DD → YYMMDD
-            parts = date_str.split('.')
-            suggested_filename = f"{parts[0][2:]}{parts[1]}{parts[2]}미사.pptx"
-            st.caption(f"자동 인식: {date_str}")
+        if problems:
+            st.warning("다음 주 자동 생성에 문제가 생길 수 있습니다:\n\n" + "\n".join(f"- {p}" for p in problems))
         else:
-            suggested_filename = "미사.pptx"
-            st.warning("⚠️ 표지 슬라이드에서 날짜를 찾을 수 없습니다")
+            st.success("PPT 구조 점검 통과")
 
-        # 파일명 입력
-        filename = st.text_input(
-            "저장 파일명",
-            value=suggested_filename,
-            placeholder="YYMMDD미사.pptx",
-            help="YYMMDD미사.pptx 형식 (예: 261017미사.pptx)"
-        )
+        date_str = cover_date_of(ppt_bytes)
+        if date_str:
+            st.caption(f"표지 날짜 인식: {date_str}")
+        filename = st.text_input("저장 파일명", value=filename_from_cover_date(date_str),
+                                 placeholder="YYMMDD미사.pptx (예: 261017미사.pptx)")
+        uploader = st.text_input("올린 사람 이름 (선택)")
+        valid = bool(re.fullmatch(r'\d{6}미사\.pptx', filename or ''))
+        if filename and not valid:
+            st.error("파일명은 YYMMDD미사.pptx 형식이어야 합니다 (토요일 날짜, 예: 261017미사.pptx).")
 
-        if filename and not filename.endswith('.pptx'):
-            filename += '.pptx'
+        exists = valid and filename in [f.name for f in storage.list_archive()]
+        overwrite = True
+        if exists:
+            overwrite = st.checkbox(f"{filename} 파일이 이미 있습니다. 덮어쓸까요?")
 
-        # 파일명 검증
-        if filename and not storage._validate_ppt_filename(filename):
-            st.error(f"❌ 파일명 형식이 잘못되었습니다. YYMMDD미사.pptx 형식을 사용하세요.")
-            return
+        if st.button("💾 저장", type="primary", disabled=not (valid and overwrite)):
+            with st.spinner("저장 중..."):
+                try:
+                    ok = storage.save_archive(filename, ppt_bytes, uploader or None)
+                except Exception as e:
+                    ok = False
+                    st.error(f"저장 중 문제가 생겼습니다: {e}")
+            if ok:
+                st.cache_data.clear()
+                st.success(f"{filename} 저장 완료. 다음 PPT 만들기의 기준으로 선택됩니다.")
+            else:
+                st.error("저장하지 못했습니다. 잠시 후 다시 시도해 주세요.")
 
-        # 올린 사람
-        uploader = st.text_input(
-            "올린 사람 이름 (선택)",
-            placeholder="예: 김지현 선생님",
-            help="(선택) 이 파일을 올린 사람의 이름을 기록합니다"
-        )
-
-        # 저장
-        col1, col2 = st.columns(2)
-
-        with col1:
-            if st.button("💾 저장", use_container_width=True, type="primary"):
-                # 기존 파일 확인
-                if filename in [f.name for f in storage.list_archive()]:
-                    if st.checkbox("같은 날짜의 파일이 있습니다. 덮어쓰시겠습니까?"):
-                        if storage.save_archive(filename, ppt_bytes, uploader):
-                            st.success(f"✅ {filename}로 저장되었습니다")
-                            st.session_state.generated_ppt = None  # 초기화
-                        else:
-                            st.error("❌ 저장 실패")
-                else:
-                    if storage.save_archive(filename, ppt_bytes, uploader):
-                        st.success(f"✅ {filename}로 저장되었습니다")
-                        st.session_state.generated_ppt = None
-                    else:
-                        st.error("❌ 저장 실패")
-
-        with col2:
-            if st.button("❌ 취소", use_container_width=True):
-                st.rerun()
-
-    # 최근 최종본 목록
     st.subheader("최근 최종본")
-
     archive_files = storage.list_archive()
-
-    if archive_files:
-        for file_info in archive_files[:10]:  # 최근 10개
-            col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
-
-            with col1:
-                st.caption(f"📄 {file_info.name}")
-
-            with col2:
-                st.caption(f"{file_info.modified_time.strftime('%m월 %d일')}")
-
-            with col3:
-                size_kb = file_info.size / 1024
-                st.caption(f"{size_kb:.0f}KB")
-
-            with col4:
-                if st.button("⬇️", key=f"dl_{file_info.name}", help="다운로드"):
-                    ppt_bytes = storage.read_archive(file_info.name)
-                    if ppt_bytes:
-                        st.download_button(
-                            label="다운로드",
-                            data=ppt_bytes,
-                            file_name=file_info.name,
-                            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                            key=f"download_{file_info.name}"
-                        )
-    else:
+    if not archive_files:
         st.info("저장된 최종본이 없습니다")
+    for info in archive_files[:10]:
+        st.write(f"📄 **{info.name}** · {info.size / 1024 / 1024:.1f}MB"
+                 + (f" · {info.uploader}" if info.uploader else ""))
+        if st.button("파일 준비", key=f"prep_{info.name}"):
+            st.session_state[f"dl_{info.name}"] = storage.read_archive(info.name)
+        data = st.session_state.get(f"dl_{info.name}")
+        if data:
+            st.download_button(f"📥 {info.name} 다운로드", data=data, file_name=info.name,
+                               mime=PPTX_MIME, key=f"download_{info.name}")
 
 
 def page_manage_songs():
@@ -454,7 +310,6 @@ def page_manage_songs():
     songs = storage.list_songs()
 
     if songs:
-        import re
         # 번호별로 그룹화
         hymn_dict = {}
         for song in songs:
@@ -474,9 +329,9 @@ def page_manage_songs():
             cols = st.columns([1, 3, 1])
 
             with cols[0]:
-                img = storage.read_song(hymn_num)
-                if img:
-                    st.image(Image.open(io.BytesIO(img)), width=80, caption=f"{hymn_num}번")
+                images = storage.get_hymn_images(hymn_num)
+                if images:
+                    st.image(Image.open(io.BytesIO(images[0])), width=80, caption=f"{hymn_num}번")
 
             with cols[1]:
                 st.write(f"**{hymn_num}번** ({len(hymn_files)}장)")
@@ -513,7 +368,6 @@ def page_manage_songs():
     )
 
     if uploaded_files:
-        import re
         files_to_upload = []
 
         for uploaded_file in uploaded_files:
@@ -574,23 +428,15 @@ def page_manage_songs():
         st.rerun()
 
 
-# 메인
 def main():
     st.title("⛪ 개포동성당 초등부 미사 PPT")
-    st.markdown("비개발자를 위한 간편한 PPT 자동 생성 시스템")
-
-    # 탭 구성
     tab1, tab2, tab3 = st.tabs(["📝 PPT 만들기", "📤 최종본 올리기", "🎵 성가 관리"])
-
     with tab1:
         page_create_ppt()
-
     with tab2:
         page_upload_archive()
-
     with tab3:
         page_manage_songs()
 
 
-if __name__ == "__main__":
-    main()
+main()

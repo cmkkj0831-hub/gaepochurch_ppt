@@ -1,137 +1,136 @@
-"""
-매일미사 웹사이트에서 전례 정보를 파싱하는 모듈.
-"""
+"""매일미사 페이지에서 PPT에 필요한 전례 정보를 섹션 단위로 추출한다."""
 import re
+from datetime import date, timedelta
 from typing import Optional
-from urllib.parse import urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
 
+USER_AGENT = (
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+)
+
+FIELD_KEYS = [
+    'cover_title', 'cover_date', 'liturgy_title',
+    'first_reading_intro', 'first_reading_ref',
+    'psalm_refrain',
+    'second_reading_intro', 'second_reading_ref',
+    'gospel_acclamation',
+    'gospel_intro', 'gospel_ref',
+    'communion_antiphon',
+]
+
+
+class ParseError(Exception):
+    pass
+
+
+def fetch_html(url: str) -> str:
+    try:
+        resp = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        raise ParseError(f'매일미사 페이지를 불러오지 못했습니다: {e}') from e
+    resp.encoding = 'utf-8'
+    return resp.text
+
 
 def parse_mass_url(url: str) -> dict:
-    """
-    매일미사 웹사이트 URL에서 전례 정보를 추출합니다.
+    return parse_html(fetch_html(url))
 
-    Args:
-        url: 매일미사 웹사이트 URL
 
-    Returns:
-        dict: 전례 정보 (없는 항목은 None)
-    """
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                      'AppleWebKit/537.36 (KHTML, like Gecko) '
-                      'Chrome/91.0.4472.124 Safari/537.36'
-    }
+def make_cover_title(raw: Optional[str]) -> Optional[str]:
+    """'(녹) 연중 제29주일, …미사(전교 주일)' -> '연중 제 29 주일(전교 주일)'"""
+    if not raw:
+        return None
+    title = raw.strip().strip('[]').strip()
+    title = re.sub(r'^\(\s*[^()]{1,3}\s*\)\s*', '', title)
+    if ',' in title:
+        head = title.split(',', 1)[0].strip()
+        tail = re.search(r'(\([^()]*\))\s*$', title)
+        if tail and tail.group(1) not in head:
+            head += tail.group(1)
+        title = head
+    title = re.sub(r'제\s*(\d+)\s*주일', r'제 \1 주일', title)
+    return title.strip()
 
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.encoding = 'utf-8'
-    except requests.RequestException as e:
-        raise Exception(f"URL 접근 실패: {e}")
 
-    soup = BeautifulSoup(response.text, 'html.parser')
+def _section_lines(soup: BeautifulSoup) -> dict:
+    form = soup.find('form', attrs={'name': 'contents'})
+    if form is None:
+        return {}
+    sections = {}
+    for h3 in form.find_all('h3'):
+        name = h3.get_text(strip=True)
+        lines = []
+        for sib in h3.next_siblings:
+            if getattr(sib, 'name', None) == 'h3':
+                break
+            text = sib.get_text('\n') if hasattr(sib, 'get_text') else str(sib)
+            lines.extend(ln.strip() for ln in text.split('\n'))
+        lines = [ln for ln in lines if ln]
+        if name not in sections:
+            sections[name] = lines
+    return sections
 
-    # URL에서 날짜 추출
-    parsed_url = urlparse(url)
-    query_params = parse_qs(parsed_url.query)
-    gomonth = query_params.get('gomonth', [None])[0]
 
-    data = {
-        'date': gomonth,
-        'liturgy_title': None,
-        'first_reading_intro': None,
-        'first_reading_ref': None,
-        'responsorial_refrain': None,
-        'second_reading_intro': None,
-        'second_reading_ref': None,
-        'gospel_acclamation': None,
-        'gospel_intro': None,
-        'gospel_ref': None,
-        'communion_hymn': None,
-    }
+def _source_and_ref(lines: Optional[list], pattern: str):
+    if not lines:
+        return None, None
+    for i, line in enumerate(lines):
+        m = re.match(pattern, line)
+        if m:
+            ref = line[m.end():].strip()
+            if not ref and i + 1 < len(lines) and re.match(r'\d', lines[i + 1]):
+                ref = lines[i + 1].strip()
+            return m.group(1).strip(), (ref or None)
+    return None, None
 
-    # 페이지 전체 텍스트에서 정보 추출
-    page_text = soup.get_text()
 
-    # 전례일 제목 (예: "(녹) 연중 제29주일, ...")
-    title_match = re.search(
-        r'\([^\)]*\)\s*연중 제\d+주일[^\n]*',
-        page_text
-    )
-    if title_match:
-        data['liturgy_title'] = title_match.group(0).strip()
+def _first_starting(lines: Optional[list], mark: str) -> Optional[str]:
+    for line in lines or []:
+        if line.startswith(mark):
+            return line.split('또는')[0].strip()
+    return None
 
-    # 모든 "▥" 항목 찾기 (독서 출처들)
-    all_readings = re.findall(
-        r'▥\s*([^\d]+?(?:입니다\.))\s*(\d+[,:\d\-ㄱㄴㄷ]+)',
-        page_text,
-        re.DOTALL
-    )
 
-    # 첫 번째 독서
-    if len(all_readings) > 0:
-        intro = all_readings[0][0].strip()
-        ref = all_readings[0][1].strip()
-        # 참조 번호 숫자 부분만 (첫 번째 숫자 그룹까지)
-        ref_clean = re.match(r'(\d+[,\d\-ㄱㄴㄷ]*)', ref)
-        if ref_clean:
-            data['first_reading_intro'] = '▥ ' + intro
-            data['first_reading_ref'] = ref_clean.group(1)
+def parse_html(html: str) -> dict:
+    soup = BeautifulSoup(html, 'html.parser')
+    fields = dict.fromkeys(FIELD_KEYS)
 
-    # 두 번째 독서
-    if len(all_readings) > 1:
-        intro = all_readings[1][0].strip()
-        ref = all_readings[1][1].strip()
-        ref_clean = re.match(r'(\d+[,\d\-ㄱㄴㄷ]*)', ref)
-        if ref_clean:
-            data['second_reading_intro'] = '▥ ' + intro
-            data['second_reading_ref'] = ref_clean.group(1)
+    today = soup.find('p', class_='today')
+    if today:
+        m = re.search(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일', today.get_text())
+        if m:
+            sunday = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            fields['cover_date'] = (sunday - timedelta(days=1)).strftime('%Y.%m.%d')
 
-    # 화답송 후렴 (첫 번째 ◎만, "또는" 제외)
-    responsorial_matches = re.findall(
-        r'◎\s*([^\n◎]*?)(?:또는|\n|$)',
-        page_text
-    )
-    if responsorial_matches:
-        refrain = responsorial_matches[0].strip()
-        if refrain:
-            data['responsorial_refrain'] = '◎ ' + refrain
+    title_el = soup.find('p', class_='m_t_today01')
+    if title_el:
+        raw = title_el.get_text(strip=True).strip('[]').strip()
+        fields['liturgy_title'] = raw or None
+        fields['cover_title'] = make_cover_title(raw)
 
-    # 복음 환호송 (○ 구절, 첫 번째만)
-    gospel_acclamation_match = re.search(
-        r'○\s*([^\n◎]+)',
-        page_text
-    )
-    if gospel_acclamation_match:
-        text = gospel_acclamation_match.group(1).strip()
-        data['gospel_acclamation'] = text
+    sec = _section_lines(soup)
 
-    # 복음 출처 ("✠"로 시작하는 항목)
-    gospel_match = re.search(
-        r'✠\s*([^\d]+?(?:입니다\.))\s*(\d+[,:\d\-ㄱㄴㄷ]+)',
-        page_text,
-        re.DOTALL
-    )
-    if gospel_match:
-        intro = gospel_match.group(1).strip()
-        ref = gospel_match.group(2).strip()
-        ref_clean = re.match(r'(\d+[,\d\-ㄱㄴㄷ]*)', ref)
-        if ref_clean:
-            data['gospel_intro'] = '✠ ' + intro
-            data['gospel_ref'] = ref_clean.group(1)
+    fields['first_reading_intro'], fields['first_reading_ref'] = _source_and_ref(
+        sec.get('제1독서'), r'(▥.*?말씀입니다\.)')
+    fields['second_reading_intro'], fields['second_reading_ref'] = _source_and_ref(
+        sec.get('제2독서'), r'(▥.*?말씀입니다\.)')
+    fields['gospel_intro'], fields['gospel_ref'] = _source_and_ref(
+        sec.get('복음'), r'(✠.*?복음입니다\.)')
 
-    # 영성체송 본문
-    # "영성체송" 섹션에서 출처를 제외한 본문
-    communion_match = re.search(
-        r'영성체송\s*(?:[\s\S]*?)([^\n]+)',
-        page_text
-    )
-    if communion_match:
-        hymn_text = communion_match.group(1).strip()
-        # 불릿, 번호 등 제외
-        if not hymn_text.startswith(('참조', '마')):
-            data['communion_hymn'] = hymn_text
+    fields['psalm_refrain'] = _first_starting(sec.get('화답송'), '◎')
+    fields['gospel_acclamation'] = _first_starting(sec.get('복음 환호송'), '○')
 
-    return data
+    comm = sec.get('영성체송')
+    if comm and len(comm) > 1:
+        body = []
+        for line in comm[1:]:
+            if re.fullmatch(r'<?\s*또는\s*>?', line):
+                break
+            body.append(line)
+        fields['communion_antiphon'] = ' '.join(body).strip() or None
+
+    return fields

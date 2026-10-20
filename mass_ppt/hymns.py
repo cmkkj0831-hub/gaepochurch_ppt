@@ -1,224 +1,356 @@
-"""
-성가 이미지를 PPT 슬라이드에 삽입하는 모듈.
-"""
+"""성가 번호 슬라이드 묶음(입당/봉헌/성체/파견)을 새 성가 이미지로 교체한다."""
+import copy
 import io
 import re
-import tempfile
-import zipfile
-from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, List
+
 from lxml import etree
+from PIL import Image
+
+from .pptx_package import (
+    CONTENT_TYPES, NS, REL_SLIDE, Package, compact, qn, relative, rels_path,
+    shape_text, slide_title, sp_tree_children,
+)
+
+ROLES = ('entrance', 'offertory', 'communion', 'recessional')
+ROLE_LABELS = {'entrance': '입당', 'offertory': '봉헌', 'communion': '성체', 'recessional': '파견'}
+NUMBER_BOX_W = 1567543
+P14 = 'http://schemas.microsoft.com/office/powerpoint/2010/main'
+REL_NOTES = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide'
+REL_IMAGE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image'
+IMAGE_TYPES = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg'}
 
 
-_NAMESPACES = {
-    'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
-    'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
-    'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
-}
+class HymnTemplateError(Exception):
+    pass
 
 
-def _find_hymn_slides(slide_elem) -> Optional[int]:
-    """
-    슬라이드가 성가 번호 슬라이드인지 확인하고, 번호를 반환.
-    조건: 숫자만 적힌 텍스트박스 1개 + 그림 1개
-
-    Returns:
-        성가 번호 (int) 또는 None
-    """
-    namespaces = _NAMESPACES
-
-    # 숫자만 있는 텍스트 찾기
-    for shape in slide_elem.findall('.//p:sp', namespaces):
-        text_body = shape.find('.//p:txBody', namespaces)
-        if text_body is None:
-            continue
-
-        text = ''.join(t.text or '' for t in text_body.findall('.//a:t', namespaces))
-        if text.strip().isdigit():
-            return int(text.strip())
-
-    return None
+def hymn_number(slide_root):
+    """성가 번호 슬라이드(그림 1 + 숫자뿐인 텍스트 1, 그 외 도형 없음)면 번호, 아니면 None."""
+    kids = sp_tree_children(slide_root)
+    names = sorted(etree.QName(k).localname for k in kids)
+    if names != ['pic', 'sp']:
+        return None
+    sp = next(k for k in kids if etree.QName(k).localname == 'sp')
+    text = shape_text(sp).strip()
+    return int(text) if text.isdigit() else None
 
 
-def _find_hymn_slide_groups(slides_xml: list) -> dict:
-    """
-    연속된 성가 슬라이드들을 그룹화.
-
-    Returns:
-        {
-            'entrance': [(start_idx, count), ...],
-            'offertory': [(start_idx, count), ...],
-            'communion': [(start_idx, count), ...],
-            'recessional': [(start_idx, count), ...]
-        }
-    """
-    namespaces = _NAMESPACES
-    hymn_groups = {
-        'entrance': [],
-        'offertory': [],
-        'communion': [],
-        'recessional': []
-    }
-
-    # 앵커 텍스트로 전례 구간 찾기
-    entrance_start = None
-    offertory_start = None
-    communion_start = None
-    recessional_start = None
-
-    for idx, slide_bytes in enumerate(slides_xml):
-        tree = etree.fromstring(slide_bytes)
-
-        # 앵커 텍스트 검색
-        all_text = ''.join(
-            t.text or ''
-            for t in tree.findall('.//a:t', namespaces)
-        )
-
-        if '예물 준비' in all_text:
-            offertory_start = idx
-        elif '영 성 체' in all_text and '기도' not in all_text:  # 영성체송 (기도문 제외)
-            communion_start = idx
-
-    # 성가 슬라이드 탐색
-    i = 0
-    while i < len(slides_xml):
-        slide_bytes = slides_xml[i]
-        tree = etree.fromstring(slide_bytes)
-        hymn_num = _find_hymn_slides(tree)
-
-        if hymn_num is not None:
-            # 연속된 성가 슬라이드 묶음 세기
-            start_idx = i
-            count = 1
-            j = i + 1
-            while j < len(slides_xml):
-                tree_next = etree.fromstring(slides_xml[j])
-                hymn_next = _find_hymn_slides(tree_next)
-                if hymn_next == hymn_num:
-                    count += 1
-                    j += 1
-                else:
-                    break
-
-            # 위치 결정
-            if entrance_start is None or start_idx < (offertory_start or float('inf')):
-                hymn_groups['entrance'].append((start_idx, count, hymn_num))
-                entrance_start = start_idx
-            elif offertory_start and start_idx >= offertory_start and start_idx < (communion_start or float('inf')):
-                hymn_groups['offertory'].append((start_idx, count, hymn_num))
-                offertory_start = start_idx
-            elif communion_start and start_idx >= communion_start:
-                # 성체성가와 파견 구분 (영성체송 뒤로 2개 묶음)
-                # 첫 번째: 성체, 두 번째: 파견
-                if not hymn_groups['communion']:
-                    hymn_groups['communion'].append((start_idx, count, hymn_num))
-                else:
-                    hymn_groups['recessional'].append((start_idx, count, hymn_num))
-
-            i = j
-        else:
-            i += 1
-
-    return hymn_groups
+def find_hymn_bundles(pkg: Package) -> List[List[int]]:
+    """연속된 성가 번호 슬라이드 묶음 (슬라이드 번호는 1부터)."""
+    bundles, cur = [], []
+    for i, part in enumerate(pkg.slide_parts(), 1):
+        if hymn_number(pkg.xml(part)) is not None:
+            cur.append(i)
+        elif cur:
+            bundles.append(cur)
+            cur = []
+    if cur:
+        bundles.append(cur)
+    return bundles
 
 
-def _get_image_dimensions(image_bytes: bytes) -> Tuple[int, int]:
-    """이미지 크기 (px)를 구함."""
-    from PIL import Image
-    img = Image.open(io.BytesIO(image_bytes))
-    return img.size
-
-
-def _calculate_image_position(image_bytes: bytes, content_width: int, content_height: int) -> Tuple[int, int, int, int]:
-    """
-    이미지를 content 영역에 맞게 배치.
-    content_width: 오른쪽 여유 공간 (px)
-    content_height: 아래쪽 여유 공간 (px)
-
-    Returns:
-        (x_offset, y_offset, width, height) - EMU 단위
-    """
-    img_w, img_h = _get_image_dimensions(image_bytes)
-
-    # 비율 유지하며 최대 크기로 스케일링
-    aspect_ratio = img_w / img_h
-    if content_width / content_height > aspect_ratio:
-        # 높이 기준으로 맞춤
-        new_h = content_height
-        new_w = int(content_height * aspect_ratio)
+def place_image(img_w: int, img_h: int, slide_w: int = 12192000, slide_h: int = 6858000):
+    """이미지 영역(x=번호칸 오른쪽~끝, y=0~끝)에 비율 유지 최대 크기로 가운데 배치. (x, y, cx, cy)"""
+    ax, ay, aw, ah = NUMBER_BOX_W, 0, slide_w - NUMBER_BOX_W, slide_h
+    if img_w * ah >= img_h * aw:
+        cx, cy = aw, aw * img_h // img_w
     else:
-        # 너비 기준으로 맞춤
-        new_w = content_width
-        new_h = int(content_width / aspect_ratio)
-
-    # 가운데 정렬
-    x_offset = int((content_width - new_w) / 2)
-    y_offset = int((content_height - new_h) / 2)
-
-    # EMU로 변환 (DPI 96 기준: 914400 EMU/inch, 1 inch = 96px)
-    # 72 DPI 기준: 914400 EMU/inch, 1 inch = 72px
-    emu_per_px = 914400 / 96  # = 9525
-
-    return (
-        int(1567543 + x_offset * emu_per_px),  # x는 텍스트박스 끝 위치부터
-        int(y_offset * emu_per_px),
-        int(new_w * emu_per_px),
-        int(new_h * emu_per_px)
-    )
+        cx, cy = ah * img_w // img_h, ah
+    return ax + (aw - cx) // 2, ay + (ah - cy) // 2, cx, cy
 
 
-def replace_hymn_slides(
-    ppt_bytes: bytes,
-    hymn_numbers: dict,
-    get_hymn_image: Callable[[int], Optional[bytes]]
-) -> Tuple[bytes, dict]:
-    """
-    성가 슬라이드를 교체합니다.
+def _has_text(root, needle):
+    return any(needle in compact(shape_text(sp)) for sp in root.iter(qn('p:sp')))
 
-    Args:
-        ppt_bytes: 템플릿 PPT
-        hymn_numbers: {'entrance': 58, 'offertory': 106, 'communion': [128, 129], 'recessional': 61}
-        get_hymn_image: callable(hymn_number: int) -> bytes or None
 
-    Returns:
-        (result_bytes, report)
-        report: {
-            'inserted_hymns': [...],
-            'warnings': [...]
-        }
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
+class _Deck:
+    """presentation.xml의 슬라이드 목록과 관련 part들을 함께 고친다."""
 
-        # PPT 압축 해제
-        extract_dir = tmpdir / 'pptx'
-        with zipfile.ZipFile(io.BytesIO(ppt_bytes), 'r') as z:
-            z.extractall(extract_dir)
+    def __init__(self, pkg: Package):
+        self.pkg = pkg
+        self.pres = pkg.xml('ppt/presentation.xml')
+        self.pres_rels = pkg.xml(rels_path('ppt/presentation.xml'))
+        self.ct = pkg.xml(CONTENT_TYPES)
+        self.sld_lst = self.pres.find('p:sldIdLst', NS)
+        rmap = {r.get('Id'): r.get('Target') for r in self.pres_rels}
+        self.part_of = {s.get('id'): 'ppt/' + rmap[s.get(qn('r:id'))] for s in self.sld_lst}
+        self.replaced = {}
+        self.deleted = set()
 
-        slides_dir = extract_dir / 'ppt' / 'slides'
+    def ids(self):
+        return [s.get('id') for s in self.sld_lst]
 
-        # 모든 슬라이드 XML 로드
-        slide_files = sorted(slides_dir.glob('slide*.xml'))
-        slides_xml = {}
-        for slide_file in slide_files:
-            slide_idx = int(slide_file.stem[5:])
-            with open(slide_file, 'rb') as f:
-                slides_xml[slide_idx] = f.read()
+    def parts(self):
+        return [self.part_of[i] for i in self.ids()]
 
-        # 성가 그룹 탐지
-        slide_list = [slides_xml[i] for i in sorted(slides_xml.keys())]
-        hymn_groups = _find_hymn_slide_groups(slide_list)
+    def move_after(self, sid, after_sid):
+        el = next(s for s in self.sld_lst if s.get('id') == sid)
+        anchor = next(s for s in self.sld_lst if s.get('id') == after_sid)
+        self.sld_lst.remove(el)
+        anchor.addnext(el)
 
-        # 성가 삽입
-        report = {
-            'inserted_hymns': [],
-            'warnings': []
-        }
+    def _next_slide_name(self):
+        nums = [int(m.group(1)) for n in self.pkg.parts
+                if (m := re.fullmatch(r'ppt/slides/slide(\d+)\.xml', n))]
+        return f'ppt/slides/slide{max(nums) + 1}.xml'
 
-        # 임시로 슬라이드 인덱스 관리
-        # (너무 복잡하므로 단순화: 각 위치에서 기존 슬라이드 삭제 후 새로 삽입)
+    def _next_media_name(self, ext):
+        n = 1
+        while any(p.startswith(f'ppt/media/hymn{n}.') for p in self.pkg.parts):
+            n += 1
+        return f'ppt/media/hymn{n}.{ext}'
 
-        result_bytes = ppt_bytes  # 일단 원본 반환 (2단계에서 구현)
+    def _next_rid(self):
+        used = {r.get('Id') for r in self.pres_rels}
+        n = 1
+        while f'rId{n}' in used:
+            n += 1
+        return f'rId{n}'
 
-        return result_bytes, report
+    def add_slide_like(self, template_part, number, image_bytes, after_el):
+        pkg = self.pkg
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            fmt, (w, h) = (im.format or '').lower(), im.size
+        ext = {'png': 'png', 'jpeg': 'jpg'}.get(fmt)
+        if ext is None:
+            raise HymnTemplateError(f'{number}번 성가 이미지 형식({fmt or "알 수 없음"})은 지원하지 않습니다. png/jpg만 가능합니다.')
+        media = self._next_media_name(ext)
+        pkg.write(media, image_bytes)
+
+        slide = pkg.xml(template_part)
+        kids = sp_tree_children(slide)
+        sp = next(k for k in kids if etree.QName(k).localname == 'sp')
+        pic = next(k for k in kids if etree.QName(k).localname == 'pic')
+        runs = [r for r in sp.iter(qn('a:r'))]
+        runs[0].find('a:t', NS).text = str(number)
+        for r in runs[1:]:
+            r.find('a:t', NS).text = ''
+
+        sld_sz = self.pres.find('p:sldSz', NS)
+        x, y, cx, cy = place_image(w, h, int(sld_sz.get('cx')), int(sld_sz.get('cy')))
+        xfrm = pic.find('p:spPr/a:xfrm', NS)
+        xfrm.find('a:off', NS).attrib.update({'x': str(x), 'y': str(y)})
+        xfrm.find('a:ext', NS).attrib.update({'cx': str(cx), 'cy': str(cy)})
+        blip_fill = pic.find('p:blipFill', NS)
+        for src in blip_fill.findall('a:srcRect', NS):
+            blip_fill.remove(src)
+        if blip_fill.find('a:stretch', NS) is None:
+            etree.SubElement(blip_fill, qn('a:stretch'))
+        stretch = blip_fill.find('a:stretch', NS)
+        if stretch.find('a:fillRect', NS) is None:
+            etree.SubElement(stretch, qn('a:fillRect'))
+        embed = blip_fill.find('a:blip', NS).get(qn('r:embed'))
+
+        new_part = self._next_slide_name()
+        rels = pkg.xml(rels_path(template_part))
+        for r in list(rels):
+            if r.get('Type') == REL_NOTES:
+                rels.remove(r)
+            elif r.get('Id') == embed:
+                r.set('Target', relative(new_part, media))
+        pkg.write_xml(new_part, slide)
+        pkg.write_xml(rels_path(new_part), rels)
+
+        ctype = next(o.get('ContentType') for o in self.ct.findall('ct:Override', NS)
+                     if o.get('PartName') == '/' + template_part)
+        etree.SubElement(self.ct, qn('ct:Override'), PartName='/' + new_part, ContentType=ctype)
+
+        rid = self._next_rid()
+        etree.SubElement(self.pres_rels, '{%s}Relationship' % NS['rel'],
+                         Id=rid, Type=REL_SLIDE, Target=relative('ppt/presentation.xml', new_part))
+        new_id = str(max(int(i) for i in list(self.part_of) + self.ids()) + 1)
+        el = etree.Element(qn('p:sldId'), id=new_id)
+        el.set(qn('r:id'), rid)
+        if after_el is None:
+            self.sld_lst.insert(0, el)
+        else:
+            after_el.addnext(el)
+        self.part_of[new_id] = new_part
+        return el
+
+    def delete_slide(self, sid):
+        pkg = self.pkg
+        el = next(s for s in self.sld_lst if s.get('id') == sid)
+        rid = el.get(qn('r:id'))
+        self.sld_lst.remove(el)
+        for r in list(self.pres_rels):
+            if r.get('Id') == rid:
+                self.pres_rels.remove(r)
+        part = self.part_of[sid]
+        for _, rtype, target, ext in pkg.rels(part):
+            if rtype == REL_NOTES and not ext:
+                pkg.delete(rels_path(target))
+                pkg.delete(target)
+                self._drop_override(target)
+        pkg.delete(rels_path(part))
+        pkg.delete(part)
+        self._drop_override(part)
+        self.deleted.add(sid)
+
+    def _drop_override(self, part):
+        for o in self.ct.findall('ct:Override', NS):
+            if o.get('PartName') == '/' + part:
+                self.ct.remove(o)
+
+    def _sync_sections(self):
+        order = {sid: i for i, sid in enumerate(self.ids())}
+        for sec_lst in self.pres.iter('{%s}sldIdLst' % P14):
+            new_ids = []
+            for s in sec_lst:
+                sid = s.get('id')
+                new_ids.extend(self.replaced.get(sid, []))
+                if sid not in self.deleted:
+                    new_ids.append(sid)
+            new_ids.sort(key=lambda i: order.get(i, len(order)))
+            for s in list(sec_lst):
+                sec_lst.remove(s)
+            for sid in new_ids:
+                etree.SubElement(sec_lst, '{%s}sldId' % P14, id=sid)
+
+    def _ensure_image_defaults(self):
+        have = {d.get('Extension').lower() for d in self.ct.findall('ct:Default', NS)}
+        for ext, ctype in IMAGE_TYPES.items():
+            if ext not in have:
+                d = etree.Element(qn('ct:Default'), Extension=ext, ContentType=ctype)
+                self.ct.insert(0, d)
+
+    def _drop_orphan_media(self):
+        used = set()
+        for name in list(self.pkg.parts):
+            if name.endswith('.rels'):
+                src = name.replace('_rels/', '').removesuffix('.rels')
+                for _, _, target, ext in self.pkg.rels(src):
+                    if not ext:
+                        used.add(target)
+        for name in list(self.pkg.parts):
+            if name.startswith('ppt/media/') and name not in used:
+                self.pkg.delete(name)
+
+    def _update_app_counts(self):
+        name = 'docProps/app.xml'
+        if name not in self.pkg.parts:
+            return
+        app = self.pkg.xml(name)
+        slides = app.find('ep:Slides', NS)
+        if slides is not None:
+            slides.text = str(len(self.ids()))
+        notes = app.find('ep:Notes', NS)
+        if notes is not None:
+            notes.text = str(sum(1 for n in self.pkg.parts
+                                 if re.fullmatch(r'ppt/notesSlides/notesSlide\d+\.xml', n)))
+        self.pkg.write_xml(name, app)
+
+    def finish(self):
+        self._sync_sections()
+        self._ensure_image_defaults()
+        self.pkg.write_xml('ppt/presentation.xml', self.pres)
+        self.pkg.write_xml(rels_path('ppt/presentation.xml'), self.pres_rels)
+        self.pkg.write_xml(CONTENT_TYPES, self.ct)
+        self._drop_orphan_media()
+        self._update_app_counts()
+
+
+def _fix_communion_order(deck: _Deck, warnings: list):
+    parts = deck.parts()
+    roots = [deck.pkg.xml(p) for p in parts]
+    prayer = [i for i, r in enumerate(roots) if _has_text(r, '합당치않사오나')]
+    antiphon = [i for i, r in enumerate(roots) if slide_title(r, ('영성체송',))]
+    if len(prayer) != 1 or len(antiphon) != 1:
+        raise HymnTemplateError(
+            f'영성체 기도문 슬라이드({len(prayer)}개)나 영성체송 슬라이드({len(antiphon)}개)를 '
+            '하나씩 찾지 못했습니다. 기준 PPT를 확인해 주세요.')
+    if antiphon[0] != prayer[0] + 1:
+        ids = deck.ids()
+        deck.move_after(ids[antiphon[0]], ids[prayer[0]])
+        warnings.append('영성체송 슬라이드를 영성체 기도문("합당치 않사오나") 바로 다음으로 옮겼습니다.')
+
+
+def _bundles_by_ids(deck: _Deck):
+    bundles, cur = [], []
+    for sid in deck.ids():
+        if hymn_number(deck.pkg.xml(deck.part_of[sid])) is not None:
+            cur.append(sid)
+        elif cur:
+            bundles.append(cur)
+            cur = []
+    if cur:
+        bundles.append(cur)
+    return bundles
+
+
+def _validate_bundles(deck: _Deck, bundles):
+    if len(bundles) != 4:
+        raise HymnTemplateError(
+            f'성가 번호 슬라이드 묶음이 {len(bundles)}개입니다. 입당/봉헌/성체/파견 4개여야 합니다. '
+            '기준 PPT의 성가 슬라이드(그림 1장 + 번호 칸)를 확인해 주세요.')
+    ids = deck.ids()
+    after_offertory = ids.index(bundles[1][-1]) + 1
+    if after_offertory >= len(ids) or not slide_title(
+            deck.pkg.xml(deck.part_of[ids[after_offertory]]), ('예물준비기도',)):
+        raise HymnTemplateError('봉헌 성가 묶음 바로 다음에 "예물 준비 기도" 슬라이드가 없습니다.')
+    before_communion = ids.index(bundles[2][0]) - 1
+    if before_communion < 0 or not slide_title(
+            deck.pkg.xml(deck.part_of[ids[before_communion]]), ('영성체송',)):
+        raise HymnTemplateError('성체 성가 묶음 바로 앞에 영성체송 슬라이드가 없습니다.')
+
+
+def _role_numbers(hymn_numbers: dict, role: str) -> list:
+    v = hymn_numbers.get(role)
+    if v is None:
+        return []
+    vals = v if isinstance(v, (list, tuple)) else [v]
+    out = []
+    for x in vals:
+        if x is None or str(x).strip() in ('', '0'):
+            continue
+        out.append(int(str(x).strip()))
+    return out
+
+
+def replace_hymns(ppt_bytes: bytes, hymn_numbers: dict, get_hymn_images: Callable[[int], list]):
+    """hymn_numbers = {'entrance': 58, 'offertory': 106, 'communion': [128, 129], 'recessional': 61}"""
+    pkg = Package(ppt_bytes)
+    deck = _Deck(pkg)
+    report = {'hymns': [], 'warnings': []}
+
+    _fix_communion_order(deck, report['warnings'])
+    bundles = _bundles_by_ids(deck)
+    _validate_bundles(deck, bundles)
+
+    for role, bundle in zip(ROLES, bundles):
+        template_part = deck.part_of[bundle[0]]
+        template_xml = pkg.read(template_part)
+        template_rels = pkg.read(rels_path(template_part))
+        prev = bundle[0]
+        prev_idx = deck.ids().index(prev)
+        anchor = deck.sld_lst[prev_idx - 1] if prev_idx > 0 else None
+
+        tmp_part = 'ppt/slides/_hymn_template.xml'
+        pkg.write(tmp_part, template_xml)
+        pkg.write(rels_path(tmp_part), template_rels)
+        etree.SubElement(deck.ct, qn('ct:Override'), PartName='/' + tmp_part,
+                         ContentType='application/vnd.openxmlformats-officedocument.presentationml.slide+xml')
+
+        for sid in bundle:
+            deck.delete_slide(sid)
+
+        new_ids = []
+        for num in _role_numbers(hymn_numbers, role):
+            images = get_hymn_images(num) or []
+            if not images:
+                report['warnings'].append(f'{ROLE_LABELS[role]} {num}번: 성가 이미지가 없어 넣지 않았습니다.')
+                continue
+            for img in images:
+                anchor = deck.add_slide_like(tmp_part, num, img, anchor)
+                new_ids.append(anchor.get('id'))
+            report['hymns'].append({'role': ROLE_LABELS[role], 'num': num, 'pages': len(images)})
+        deck.replaced[bundle[0]] = new_ids
+
+        pkg.delete(tmp_part)
+        pkg.delete(rels_path(tmp_part))
+        deck._drop_override(tmp_part)
+
+    deck.finish()
+    report['slide_count'] = len(deck.ids())
+    return pkg.save(), report

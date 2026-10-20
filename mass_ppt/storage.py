@@ -57,14 +57,37 @@ class Storage(ABC):
         pass
 
     @abstractmethod
-    def read_song(self, hymn_num: int, page: int = 1) -> Optional[bytes]:
-        """성가 이미지 읽기 (hymn_num-page.png/jpg 또는 hymn_num.png)."""
+    def read_song_file(self, filename: str) -> Optional[bytes]:
+        """songs/ 아래 파일 하나 읽기."""
         pass
 
-    @abstractmethod
-    def get_hymn_image_getter(self) -> callable:
-        """generate.py에 전달할 이미지 getter 함수."""
-        pass
+    def hymn_files(self, hymn_num: int) -> List[str]:
+        return hymn_page_files([f.name for f in self.list_songs()], hymn_num)
+
+    def get_hymn_images(self, hymn_num: int) -> List[bytes]:
+        """해당 번호의 모든 장을 순서대로 (num.png 또는 num-1, num-2 …)."""
+        out = []
+        for name in self.hymn_files(hymn_num):
+            data = self.read_song_file(name)
+            if data:
+                out.append(data)
+        return out
+
+
+def hymn_page_files(names: List[str], hymn_num: int) -> List[str]:
+    """파일명 목록에서 성가 번호의 이미지들을 쪽 순서로. 쪽 번호 파일이 있으면 그것만 사용."""
+    single, pages = [], []
+    for name in names:
+        m = re.fullmatch(rf'{hymn_num}(?:-(\d+))?\.(png|jpe?g)', name, re.IGNORECASE)
+        if not m:
+            continue
+        if m.group(1):
+            pages.append((int(m.group(1)), name))
+        else:
+            single.append(name)
+    if pages:
+        return [n for _, n in sorted(pages)]
+    return single[:1]
 
 
 class LocalStorage(Storage):
@@ -180,44 +203,12 @@ class LocalStorage(Storage):
 
         return sorted(files, key=lambda f: f.name)
 
-    def read_song(self, hymn_num: int, page: int = 1) -> Optional[bytes]:
-        """성가 이미지 읽기."""
-        # hymn_num-page.png/jpg 또는 hymn_num.png
-        for ext in ['.png', '.jpg', '.jpeg']:
-            # 여러 장
-            if page > 1:
-                path = self.songs_dir / f'{hymn_num}-{page}{ext}'
-                if path.exists():
-                    try:
-                        return path.read_bytes()
-                    except (IOError, OSError):
-                        pass
-            else:
-                # 한 장짜리
-                path = self.songs_dir / f'{hymn_num}{ext}'
-                if path.exists():
-                    try:
-                        return path.read_bytes()
-                    except (IOError, OSError):
-                        pass
-
-                # 여러 장의 첫 번째
-                path = self.songs_dir / f'{hymn_num}-1{ext}'
-                if path.exists():
-                    try:
-                        return path.read_bytes()
-                    except (IOError, OSError):
-                        pass
-
-        return None
-
-    def get_hymn_image_getter(self) -> callable:
-        """generate.py에 전달할 이미지 getter."""
-        def getter(hymn_num: int) -> Optional[bytes]:
-            # 첫 번째 이미지 반환
-            return self.read_song(hymn_num, page=1)
-
-        return getter
+    def read_song_file(self, filename: str) -> Optional[bytes]:
+        path = self.songs_dir / Path(filename).name
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
 
 
 class GitHubStorage(Storage):
@@ -523,29 +514,8 @@ class GitHubStorage(Storage):
 
         return sorted(files, key=lambda f: f.name)
 
-    def read_song(self, hymn_num: int, page: int = 1) -> Optional[bytes]:
-        """성가 이미지 읽기."""
-        for ext in ['.png', '.jpg', '.jpeg']:
-            # 한 장짜리
-            path = f"songs/{hymn_num}{ext}"
-            content = self._get_large_file(path)
-            if content:
-                return content
-
-            # 여러 장
-            path = f"songs/{hymn_num}-{page}{ext}"
-            content = self._get_large_file(path)
-            if content:
-                return content
-
-        return None
-
-    def get_hymn_image_getter(self) -> callable:
-        """generate.py에 전달할 이미지 getter."""
-        def getter(hymn_num: int) -> Optional[bytes]:
-            return self.read_song(hymn_num, page=1)
-
-        return getter
+    def read_song_file(self, filename: str) -> Optional[bytes]:
+        return self._get_large_file(f"songs/{Path(filename).name}")
 
     def _parse_ppt_filename(self, filename: str) -> Optional[str]:
         """YYMMDD미사.pptx에서 YYMMDD 추출."""

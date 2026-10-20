@@ -1,287 +1,104 @@
-# 천주교 초등부 주일학교 미사 PPT 자동 생성 프로젝트
+# 개포동성당 초등부 주일학교 미사 PPT 자동 생성
 
-## 프로젝트 목적
-매주 천주교 매일미사 웹사이트에서 전례 정보를 파싱하여 개포동성당 초등부 주일학교 미사 PPT를 자동으로 생성하는 웹앱.
+## 목적
+매일미사 페이지의 전례 정보와 교사가 고른 성가 번호로, 지난주 최종본 PPT를 바탕으로 이번 주 미사 PPT를 만드는 웹앱. LLM API는 쓰지 않고 규칙 기반으로만 구현한다. 사용자는 여러 명의 비개발자 교사(폰/PC 브라우저).
 
-## 전체 진행 단계
-1. **1단계**: 파서(parser.py) + 텍스트 수정기(text_edit.py) 구현 및 검증
-2. **2단계**: 성가 규칙 정의 및 성가 이미지 삽입 기능
-3. **3단계**: 웹앱 백엔드 (Flask/FastAPI)
-4. **4단계**: 웹앱 프론트엔드
-5. **5단계**: 데이터베이스 & 스케줄링
-6. **6단계**: 배포 & 테스트
+## 진행 단계
+1. 파서 + 텍스트 수정
+2. 성가 교체
+3. Streamlit UI (로컬)
+4. GitHub 저장
+5. 성가 관리 + 용량
+6. 배포
 
 ## 폴더 구조
 ```
-gaepochurch_ppt/
-├── CLAUDE.md                 # 이 파일
-├── mass_ppt/                 # 핵심 로직 패키지
-│   ├── __init__.py
-│   ├── parser.py            # URL 파싱
-│   ├── text_edit.py         # PPT 텍스트 수정
-│   ├── hymns.py             # 성가 이미지 교체
-│   ├── generate.py          # 전체 생성 함수
-│   └── models.py            # 데이터 모델
-├── songs/                    # 성가 이미지 (수정금지)
-├── archive/                  # 최종본 PPT (수정금지)
-└── tests/                    # 단위 테스트
-    ├── __init__.py
-    ├── test_parser.py
-    ├── test_text_edit.py
-    ├── test_hymns.py
-    └── test_generate.py
+app.py                  Streamlit 앱 (PPT 만들기 / 최종본 올리기 / 성가 관리)
+mass_ppt/
+  parser.py             매일미사 페이지 → 필드 dict
+  text_edit.py          필드 → 표지·말씀 전례·영성체송 run 교체
+  hymns.py              성가 번호 슬라이드 묶음 교체
+  generate.py           text_edit + hymns 통합
+  pptx_package.py       PPTX zip 읽기/쓰기 공통 헬퍼 (메모리에서만)
+  storage.py            Storage 인터페이스, LocalStorage, GitHubStorage
+archive/                최종본 PPT (원본 불변: 옮기기·이름 바꾸기·내용 변경 금지)
+songs/                  성가 이미지 (원본 불변)
+tests/                  pytest, tests/fixtures/ 에 매일미사 최소 발췌 HTML
 ```
 
 ## 파일명 규칙
-- **최종본 PPT 파일명**: `YYMMDD미사.pptx`
-  - `YY`: 연도 뒤 2자리 (예: 26 = 2026)
-  - `MM`: 월 2자리
-  - `DD`: 미사가 있는 토요일 기준 (예: 261017미사.pptx → 2026년 10월 17일)
-  - 항상 6자리 고정
+- 최종본: `YYMMDD미사.pptx`, 미사가 있는 **토요일** 날짜, 항상 6자리 (예: 261017미사.pptx). "가장 최근 최종본"은 파일명 날짜로 판단.
+- 성가 이미지: `songs/{번호}.png` (한 장) 또는 `songs/{번호}-{쪽}.png` (여러 장). png/jpg/jpeg, 대소문자 무관. 쪽 번호 파일이 있으면 그것만 쪽 순서대로 사용.
 
-## 구현 규칙
+## 공통 원칙
+- **슬라이드는 항상 내용으로 찾는다.** 슬라이드 번호를 고정으로 쓰지 않는다. 슬라이드 순서는 presentation.xml의 sldIdLst 기준(slideN.xml 파일 번호와 다를 수 있음).
+- PPT는 bytes로 받고 bytes로 반환. 디스크에 고정 이름 파일을 쓰지 않는다 (여러 명 동시 사용).
+- 이미지 재압축·자르기 금지. archive/ 원본 수정 금지.
+- 공개 저장소: 토큰·비밀번호·secrets.toml 커밋 금지, 외부 사이트 HTML 전체 커밋 금지(fixture는 필요한 줄만 남긴 최소본).
 
-### URL 파싱 (mass_ppt/parser.py)
-- **입력**: 매일미사 웹사이트 URL
-  - 예: `https://maria.catholic.or.kr/mi_pr/missa/missa.asp?menu=missa&missaid=16874&gomonth=2026-10-18&missatype=DA`
-- **기술**: requests + BeautifulSoup (LLM API 미사용, 규칙 기반만)
-- **User-Agent 필수**: 웹사이트 접근 시 반드시 User-Agent 헤더 지정
+## 1. 파서 (mass_ppt/parser.py)
+- `fetch_html(url)`(User-Agent 지정) / `parse_html(html)` / `parse_mass_url(url)`. 실패 시 `ParseError`(한국어).
+- 페이지 전체 텍스트에 정규식 금지(달력·메뉴에 같은 기호가 있음). `form[name=contents]` 안의 `h3` 섹션 제목을 찾고, 각 섹션은 "그 제목부터 다음 h3 전까지"만 본다.
+- 날짜: `p.today`("2026년 10월 18일 주일") → `cover_date` = 토요일 "YYYY.MM.DD". URL 파라미터에 의존하지 않는다.
+- 제목: `p.m_t_today01`("[(녹) …]") → `liturgy_title`, `cover_title = make_cover_title()`.
+- `make_cover_title`: 색 표시 "(녹)" 제거 → 쉼표가 있으면 쉼표 앞 + 문장 끝 괄호 → "제29주일" → "제 29 주일".
+  - "(녹) 연중 제29주일, 민족들의 복음화를 위한 미사(전교 주일)" → "연중 제 29 주일(전교 주일)"
+- 제1·2독서: 섹션 안 "▥ …말씀입니다." + 바로 뒤 장절. 복음: "✠ …복음입니다." + 장절.
+- 화답송: 섹션 안 첫 ◎ 줄, "또는" 이후 무시. 복음 환호송: ○ 줄 ("(◎ 알렐루야.)" 제외).
+- 영성체송: 첫 줄(출처 "…참조") 버리고 나머지. "<또는>" 이후 대체 영성체송은 버림.
+- 섹션이 없으면 None. 다른 섹션 값으로 대신 채우지 않는다.
+- 반환 키: `cover_title, cover_date, liturgy_title, first_reading_intro, first_reading_ref, psalm_refrain, second_reading_intro, second_reading_ref, gospel_acclamation, gospel_intro, gospel_ref, communion_antiphon`.
 
-**추출 항목**:
-1. **전례일 제목**: 예) "(녹) 연중 제29주일, 민족들의 복음화를 위한 미사(전교 주일)"
-2. **날짜**: URL의 gomonth 파라미터에서 추출
-3. **제1독서 출처**: "▥ 이사야서의 말씀입니다." + "2,1-5" (두 부분을 각각 추출)
-4. **화답송 후렴**: 첫 번째 `◎` 문장만 (있으면), "또는" 뒤는 무시
-5. **제2독서 출처**: "▥ 사도 바오로의 필리피서 말씀입니다." + "4,12-14.19-20"
-6. **복음 환호송의 ○ 구절**: "우리 주 예수 그리스도의 아버지..." 부분
-7. **복음 출처**: "✠ 마태오가 전한 거룩한 복음입니다." + "28,16-20"
-8. **영성체송 본문**: 출처 줄 제외한 본문만
+## 2. 텍스트 수정 (mass_ppt/text_edit.py)
+- `apply_text_fields(ppt_bytes, fields) -> (bytes, {'changed', 'warnings'})`.
+- 앵커는 "어느 슬라이드인지" 판단에만 쓴다. 앵커가 든 제목 칸은 절대 수정하지 않는다. 수정할 run은 run 텍스트의 시작 기호로 찾는다.
+- 대상 슬라이드: 어떤 sp의 텍스트(공백 제거)가 정확히 `제1독서 / 화답송 / 제2독서 / 복음환호송 / 복음 / 영성체송`인 슬라이드. 본문에 "복음"이 들어 있을 뿐인 슬라이드는 대상이 아니다. 각각 정확히 1개여야 하며, 0개나 2개 이상이면 수정하지 않고 경고.
+- `<a:t>` 텍스트만 바꾸고 rPr/pPr는 그대로. `text_frame.text = …` 금지. 기존 run의 앞 공백은 유지.
+- 표지(첫 슬라이드): 제목 run(앞 공백 유지), `\d{4}\.\d{2}\.\d{2}` 날짜 run.
+- 제1·2독서: "▥"로 시작하는 run → 출처, 바로 다음 run → 장절. "...", "주님의 말씀입니다", "◎ 하느님, 감사합니다"는 그대로.
+- 화답송: "◎" run 하나. 복음 환호송: "○" run 하나("◎ 알렐루야"는 그대로).
+- 복음: "✠" 포함 run → 출처(앞 공백 유지), 바로 다음 run → 장절.
+- 영성체송: 제목 칸과 "영성체 예식" 칸을 뺀 본문 칸.
+- 값이 None이면 해당 항목은 수정하지 않고 경고.
 
-**중요**: 독서 본문(말씀) 자체는 추출하지 않음. PPT의 본문 위치는 "..."로 두는 것이 원래 형식.
+## 3. 성가 교체 (mass_ppt/hymns.py)
+- 성가 번호 슬라이드 = spTree에 `p:pic` 정확히 1개 + 텍스트가 숫자뿐인 `p:sp` 정확히 1개, 그 외 도형 없음. 그 외 이미지 슬라이드(대영광송, 배경 등)는 절대 건드리지 않는다.
+- 연속된 성가 번호 슬라이드 = 한 묶음 (번호가 달라도 연속이면 같은 묶음).
+- 템플릿에는 묶음이 정확히 4개: 순서대로 입당 / 봉헌 / 성체 / 파견.
+  - 봉헌 묶음 바로 다음 = "예물 준비 기도" 슬라이드, 성체 묶음 바로 앞 = 영성체송 슬라이드.
+  - 묶음 수가 4가 아니거나 검증 실패 시 `HymnTemplateError`로 생성 중단.
+- 영성체송 슬라이드는 영성체 기도문("합당치 않사오나") 바로 다음, 성체 성가보다 앞. 어긋나면 먼저 재배치하고 경고.
+- 각 묶음을 지우고 같은 자리에, 성가마다 이미지 장수만큼 슬라이드를 넣는다 (58-1, 58-2 … / 128.png는 1장). 성체 2곡이면 1곡 다음 2곡.
+- 새 슬라이드는 묶음의 기존 성가 슬라이드를 복제하고 숫자와 이미지만 교체:
+  - 번호 칸: off(0,0) ext(1567543,1015663), 60pt bold, 가운데, 그림자 — 템플릿 서식 그대로.
+  - 이미지 영역: x=1567543 ~ 슬라이드 끝(12192000), y=0 ~ 6858000. 영역 크기 기준 비율 계산으로 최대 크기, 가로·세로 가운데 (`place_image`). 자르기(srcRect)·재압축 금지.
+- 이미지가 없는 성가는 빼고 경고.
+- 갱신 대상: presentation.xml sldIdLst와 p14 sectionLst, presentation.xml.rels, slide rels, [Content_Types].xml(slide Override, png/jpg/jpeg Default), docProps/app.xml 슬라이드 수. 지운 슬라이드(및 notes)와 고아 media 삭제. zip은 [Content_Types].xml을 맨 앞에, 원본 순서·압축 방식 유지.
 
-**반환값**: dict (없는 항목은 None)
+## 4. 이미지 가져오기와 generate
+- `Storage.get_hymn_images(num) -> list[bytes]`: 해당 번호 모든 장을 순서대로. 로컬·GitHub 모두 storage를 통해.
+- `generate(base_ppt_bytes, fields, hymn_numbers, get_hymn_images) -> (bytes, report)`:
+  - URL을 다시 파싱하지 않고 화면에서 확인·수정한 fields만 사용.
+  - `hymn_numbers = {'entrance': 58, 'offertory': 106, 'communion': [128, 129], 'recessional': 61}`
+  - report: `changed_texts, hymns[{role, num, pages}], slide_count, warnings` (None이 있어도 오류 없음).
 
-### 텍스트 수정 (mass_ppt/text_edit.py)
-- **PPT 접근**: 앵커 텍스트로 슬라이드 찾기 (고정 슬라이드 번호 사용 금지)
-  - 표지: "연중 제" 또는 "주일" 포함 첫 번째 슬라이드
-  - "제1독서" / "화답송" / "제2독서" / "복 음 환 호 송" / "복음" / "영 성 체 송" 등으로 검색
-  
-- **서식 보존**: 최우선 원칙
-  - **반드시** `<a:r>` run 단위로 텍스트만 변경
-  - `rPr` (run properties), `pPr` (paragraph properties) 유지
-  - python-pptx의 `text_frame.text = ...` 절대 금지 (서식 삭제됨)
-  - lxml 직접 조작 권장
+## Streamlit 앱 (app.py)
+- `layout="centered"`, 한국어, 한 줄에 하나씩(st.columns 최소화). 사용자 데이터는 st.session_state에만, 생성 파일은 메모리에서 바로 다운로드.
+- PPT 만들기: 기준 PPT(기본 최신 최종본 / 다른 주 선택 / 직접 업로드) → URL 불러오기 → 수정 칸(표지 제목, 표지 날짜, 독서·복음 출처+장절, 화답송, 복음환호송, 영성체송) → 성가 번호(✅/❌ + 장수) → 생성·다운로드(YYMMDD미사.pptx).
+- 최종본 올리기: 구조 점검(성가 묶음, 텍스트 슬라이드, 표지 날짜) 실패 시 경고만 하고 업로드 허용. 표지 날짜로 파일명 제안, 규칙 안 맞으면 저장 불가, 같은 날짜는 덮어쓰기 확인. 삭제 기능 없음.
+- 성가 관리: ADMIN_PASSWORD(st.secrets)로 보호. 다른 페이지는 비밀번호 없음.
 
-- **표지 날짜**: 형식 "2026.10.17" (토요일)
-  - 입력된 주일 날짜(일요일)에서 하루를 빼서 토요일 계산
-  - 기본값으로 사용
+## 저장소 (storage.py)
+- secrets에 GITHUB_TOKEN이 있으면 GitHubStorage, 없으면 LocalStorage. 토큰은 st.secrets에서만 읽는다.
+- 커밋 메시지: "최종본: 261017미사.pptx (올린 사람: OOO)", "성가 추가: 58-1.png".
 
-- **표지 제목**: 형식 예) "연중 제 29 주일(전교 주일)"
-  - 숫자 앞뒤에 공백 필수
-  - 괄호는 그대로 유지
-
-- **함수 시그니처**:
-  ```python
-  def update_ppt(ppt_bytes: bytes, data: dict) -> bytes:
-      """
-      PPT를 bytes로 받아 수정 후 bytes로 반환.
-      작업 폴더는 tempfile로 생성/삭제.
-      """
-  ```
-
-## 슬라이드 위치 (현재 템플릿 기준)
-- 슬라이드 1: 표지 (제목 + 날짜)
-- 슬라이드 27: 제1독서
-- 슬라이드 28: 화답송
-- 슬라이드 29: 제2독서
-- 슬라이드 30: 복음 환호송
-- 슬라이드 31: 복음
-- 슬라이드 56: 영성체송
-
-## 2단계: 성가 이미지 교체 (mass_ppt/hymns.py, mass_ppt/generate.py)
-
-### 성가 번호 슬라이드 정의 (가장 중요)
-- **성가 번호 슬라이드**: 그림 1개 + 숫자만 적힌 텍스트박스 1개로 이루어진 슬라이드
-  - 이 슬라이드만 교체 대상
-  - 그 외 이미지 슬라이드(대영광송, 기도문 등)는 절대 건드리지 않음
-  
-### 성가 배치 위치 (순서 중요)
-성가 번호 슬라이드 묶음은 **순서대로**:
-1. **입당** (Entrance): 첫 번째 묶음
-2. **봉헌** (Offertory): "예물 준비 기도" 앞
-3. **성체** (Communion): "영 성 체 송" 뒤
-4. **파견** (Recessional): 성체 이후
-
-### 성가 슬라이드 교체 규칙
-- **기존 슬라이드 처리**: 기존 묶음 완전히 제거
-- **새 슬라이드 삽입**: 같은 자리에 새 슬라이드 삽입 (한 장당 한 슬라이드)
-- **입력 포맷**: 
-  - 입당: 1개 (예: 58)
-  - 봉헌: 1개 (예: 106)
-  - 성체: 1~2개 (예: 128, 129)
-  - 파견: 1개 (예: 61)
-
-### 이미지 파일명 규칙
-- **형식**: `songs/{번호}-{장}.png` 또는 한 장짜리면 `songs/{번호}.png`
-  - 예: `58-1.png`, `58-2.png`, `128.png`
-- **확장자**: `.png` 또는 `.jpg` 모두 허용
-- **없는 번호**: 이미지 파일이 없으면 슬라이드 삽입 안 하고 경고 목록에 추가
-
-### 슬라이드 배치 규칙 (EMU 좌표)
-슬라이드 기본 크기: 12192000 x 6858000 EMU (10" x 5.625")
-
-**왼쪽 위 번호 텍스트박스**:
-- 위치(offset): (0, 0)
-- 크기(extent): (1567543, 1015663)
-- 포맷: 60pt bold, 가운데 정렬
-- 그림자 효과: 기존 템플릿 그대로 유지
-
-**이미지 영역**:
-- x 좌표: 1567543부터 오른쪽 끝(12192000)까지
-- 비율 유지하며 최대 크기로 맞추기
-- 영역 안에서 가로·세로 가운데 정렬
-- **원본 이미지 자르지 않음** (전체 이미지 표시)
-
-### 슬라이드 복제 방법
-- **템플릿**: 기존 성가 번호 슬라이드 XML 사용
-- **파일 갱신**:
-  - `presentation.xml`의 `sldIdLst` 갱신
-  - `ppt/slides/_rels/*.xml` 관계 파일 갱신
-  - `[Content_Types].xml` 타입 정보 갱신
-  - 고아 media 파일 정리
-
-### 고정 규칙
-**영성체송 슬라이드 배치**:
-- 영성체송 슬라이드는 반드시 영성체 기도문("합당치 않사오나") 슬라이드 바로 다음에 와야 함
-- 성체성가보다 앞에 배치해야 함
-- 어긋나 있으면 자동으로 재배치
-
-### 전체 생성 함수 (mass_ppt/generate.py)
-```python
-def generate(base_ppt_bytes: bytes, 
-             parsed_fields: dict,
-             hymn_numbers: dict,
-             get_hymn_image: callable) -> tuple[bytes, dict]:
-    """
-    PPT 생성.
-    
-    Args:
-        base_ppt_bytes: 템플릿 PPT bytes
-        parsed_fields: parser.parse_mass_url의 결과
-        hymn_numbers: {'entrance': 58, 'offertory': 106, 'communion': [128, 129], 'recessional': 61}
-        get_hymn_image: callable(hymn_number: int) -> bytes | None
-                        성가 번호 → 이미지 bytes (없으면 None)
-    
-    Returns:
-        (result_bytes, report_dict)
-        report: {
-            'updated_texts': [...],
-            'inserted_hymns': [{'num': 58, 'position': 'entrance', 'slides_added': 1}, ...],
-            'warnings': ['Hymn image not found: 999', ...]
-        }
-    """
-```
-
-**report 내용**:
-- `updated_texts`: 변경된 텍스트 항목 리스트
-- `inserted_hymns`: 삽입된 성가 정보 (번호, 위치, 슬라이드 수)
-- `warnings`: 주의사항 (없는 이미지, 배치 변경 등)
-
-## 4단계: GitHub 저장소 연동
-
-### GitHubStorage 구현
-- Fine-grained Personal Access Token 기반 (Contents r/w만)
-- Git Data API 사용 (1MB 이상 파일 지원)
-- 동시 업로드 시 충돌 재시도 로직
-- 캐싱 지원 (st.cache_data)
-
-### 용량 관리
-- **1년 예측**: 약 1.6GB (GitHub 권장 1GB 초과)
-- **대응책**: PPT 내부 이미지 재압축 (손실 압축, 화질 유지)
-- **목표**: 평균 30.8MB → 약 20MB로 축소 (압축률 약 35%)
-
-## 5단계: 용량 최적화 + 성가 관리
-
-### 용량 최적화 (ppt_compress.py)
-- **방식**: PPT 내부 이미지 재압축 (손실 JPEG 압축)
-- **구현**: 
-  - media 폴더의 이미지를 JPEG로 재인코딩
-  - 품질 85로 설정, 최대 너비 1920px로 리사이징
-  - ZIP 재압축
-- **효과**: 평균 30.8MB → 4.1MB (-86.6%)
-- **1년 누적**: 1600MB → 약 250MB (목표 달성)
-
-### 생성 파이프라인 (generate.py)
-1. URL 파싱
-2. 텍스트 수정
-3. 성가 삽입 (준비 중)
-4. **PPT 압축** (자동)
-5. 보고서 작성
-
-### 성가 관리 페이지 (app.py page_manage_songs)
-- **보안**: ADMIN_PASSWORD (st.secrets)로 보호
-- **기능**:
-  1. 현재 등록된 성가 목록 (번호별, 썸네일)
-  2. 새 성가 업로드 (파일명 자동 인식, 여러 파일 동시 업로드)
-  3. 성가 삭제 (확인 필수)
-  4. 최종본 PPT 삭제 (확인 필수)
-- **저장소**: GitHubStorage를 통해 자동 커밋
-- **캐싱**: 변경 후 즉시 캐시 초기화
-
-### 저장소 인터페이스 (mass_ppt/storage.py)
-- **abstract base class**: `Storage` (로컬/GitHub 등 다양한 구현체를 위해)
-- **LocalStorage 구현**:
-  - `list_archive()`: 최종본 PPT 목록 (날짜순 역순)
-  - `get_latest_archive()`: 가장 최근 최종본
-  - `read_archive(filename)`: 최종본 읽기
-  - `save_archive(filename, ppt_bytes, uploader)`: 최종본 저장
-  - `delete_archive(filename)`: 최종본 삭제
-  - `list_songs()`: 성가 이미지 목록
-  - `read_song(hymn_num, page)`: 성가 이미지 읽기
-  - `get_hymn_image_getter()`: generate.py용 getter 함수
-
-### 파일명 규칙 검증
-- PPT: `YYMMDD미사.pptx` (예: 261017미사.pptx)
-- 성가: `{번호}.png/jpg` 또는 `{번호}-{장}.png/jpg`
-
-### Streamlit 앱 (app.py)
-
-**페이지 1: PPT 만들기**
-1. 기준 PPT 선택 (드롭다운, 기본값: 최신)
-2. 매일미사 URL 입력 → [불러오기]
-3. 파싱 결과 수정 (텍스트 인풋/에리어):
-   - 표지 제목, 날짜
-   - 제1~2독서 출처
-   - 화답송, 복음환호송, 복음
-   - 영성체송
-4. 성가 번호 입력 (입당, 봉헌, 성체 1~2, 파견)
-   - 입력 시 즉시 ✅/❌ 표시 및 썸네일
-5. [PPT 생성] → 다운로드
-6. 생성 보고서 (변경 텍스트, 경고)
-
-**페이지 2: 최종본 올리기**
-1. PPT 업로드 → 자동 검증
-2. 표지 날짜 자동 인식 → 파일명 제안
-3. 파일명 수정 가능 (규칙 검증)
-4. 올린 사람 이름 (선택 입력)
-5. 같은 날짜 파일 있으면 확인 요청
-6. 최근 최종본 목록 (다운로드 버튼)
-
-**페이지 3: 성가 관리**
-- 현재: 저장된 성가 목록만 표시 (4단계에서 기능 추가)
-
-### 구현 특징
-- **모바일 대응**: `layout="centered"`, 좁은 화면 고려
-- **한국어 UI**: 모든 메시지 및 안내 한국어
-- **세션 상태**: `st.session_state` 사용으로 사용자별 격리
-- **예외 처리**: 모든 에러를 한국어로 표시
-- **메모리 처리**: 생성 파일은 메모리(BytesIO)에만 보관
-
-## Git 커밋 규칙
-- Co-Author 포함: `Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>`
-- 명확한 메시지: 무엇(what)보다는 왜(why) 중심
+## 용량
+- 최종본 1편 약 31MB → 1년 약 1.6GB로 GitHub 권장(1GB) 초과 예상. 대응책은 **미결정**. (PPT 내부 이미지 재압축은 하지 않는다.)
 
 ## 테스트
-- pytest 사용
-- 파서: URL 파싱 결과 검증
-- 텍스트 수정: 앵커 탐지 및 서식 보존 검증
+- `ppt_env/bin/python -m pytest` (오프라인). 파서는 tests/fixtures/의 최소 발췌 HTML로 검증.
+- 텍스트 수정은 run 단위 전체 diff로 지정 run 외 변화가 없는지 확인.
+- 시각 확인은 LibreOffice로 PDF 변환 후 이미지로 본다(한글 글꼴 대체 필요).
+
+## Git
+- push 전 토큰·비밀번호 문자열 검사. force push 금지.

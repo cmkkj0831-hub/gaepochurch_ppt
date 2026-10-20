@@ -1,100 +1,75 @@
-"""
-text_edit.py의 단위 테스트.
-"""
-import pytest
-from pathlib import Path
-from mass_ppt.text_edit import update_ppt, _format_date_for_title
+from mass_ppt.pptx_package import Package, qn
+from mass_ppt.text_edit import apply_text_fields, find_text_slides
+from tests.conftest import run_table
+
+EXPECTED_CHANGES = {
+    1: [('2026.10.10', '2026.10.17'),
+        (' 연중 제 28 주일(군인 주일)', ' 연중 제 29 주일(전교 주일)')],
+    27: [('25,6-10ㄱ', '2,1-5')],
+    28: [('◎ 저는 오래오래 주님 집에 사오리다.', '◎ 주님은 민족들의 눈앞에 당신 정의를 드러내셨네.')],
+    29: [('▥ 사도 바오로의 필리피서 말씀입니다.', '▥ 사도 바오로의 로마서 말씀입니다.'),
+         ('4,12-14.19-20', '10,9-18')],
+    30: [('○ 우리 주 예수 그리스도의 아버지, 저희 마음의 눈을 밝혀 주시어 부르심을 받은 저희의 희망을 알게 하여 주소서.',
+          '○ 주님이 말씀하신다. 너희는 가서 모든 민족들을 가르쳐라. 내가 세상 끝 날까지 언제나 너희와 함께 있으리라.')],
+    31: [('22,1-14', '28,16-20')],
+    56: [('부자들도 궁색해져 굶주리게 되지만, 주님을 찾는 이에게는 좋은 것뿐이리라.',
+          '주님이 말씀하신다. 내가 너희에게 명령한 것을 모든 민족들에게 가르쳐 지키게 하여라. 내가 세상 끝 날까지 언제나 너희와 함께 있으리라.')],
+}
 
 
-class TestFormatDateForTitle:
-    """날짜 포맷팅 테스트."""
-
-    def test_format_sunday_to_saturday(self):
-        """일요일 날짜를 토요일로 변환."""
-        # 2026-10-18 (일요일) → 2026.10.17 (토요일)
-        result = _format_date_for_title('2026-10-18')
-        assert result == '2026.10.17'
-
-    def test_format_date_with_correct_separator(self):
-        """날짜가 점(.)으로 구분되는지 확인."""
-        result = _format_date_for_title('2026-10-18')
-        assert '.' in result
-        assert '-' not in result
-
-    def test_invalid_date_returns_empty_string(self):
-        """잘못된 날짜는 빈 문자열 반환."""
-        result = _format_date_for_title('invalid')
-        assert result == ''
-
-    def test_none_returns_empty_string(self):
-        """None은 빈 문자열 반환."""
-        result = _format_date_for_title(None)
-        assert result == ''
+def test_identifies_each_text_slide_once(ppt_1010):
+    assert find_text_slides(Package(ppt_1010)) == {
+        '제1독서': [27], '화답송': [28], '제2독서': [29], '복음환호송': [30], '복음': [31], '영성체송': [56]}
 
 
-class TestUpdatePpt:
-    """PPT 수정 테스트."""
-
-    def test_update_ppt_returns_bytes(self):
-        """수정된 PPT가 bytes를 반환하는지 확인."""
-        # 실제 PPT 파일이 필요함
-        archive_ppt = Path('archive/261010미사.pptx')
-        if not archive_ppt.exists():
-            pytest.skip("archive PPT 파일이 없습니다")
-
-        with open(archive_ppt, 'rb') as f:
-            ppt_bytes = f.read()
-
-        data = {
-            'date': '2026-10-18',
-            'liturgy_title': '(녹) 연중 제29주일, 민족들의 복음화를 위한 미사(전교 주일)',
-            'first_reading_intro': '▥ 이사야서의 말씀입니다.',
-            'first_reading_ref': '2,1-5',
-            'responsorial_refrain': '◎ 주님은 민족들의 눈앞에 당신 정의를 드러내셨네.',
-            'second_reading_intro': '▥ 사도 바오로의 로마서 말씀입니다.',
-            'second_reading_ref': '10,9-18',
-            'gospel_acclamation': '우리 주 예수 그리스도의 아버지, 저희 마음의 눈을 밝혀 주시어 부르심을 받은 저희의 희망을 알게 하여 주소서.',
-            'gospel_intro': '✠ 마태오가 전한 거룩한 복음입니다.',
-            'gospel_ref': '28,16-20',
-            'communion_hymn': '주님, 이 거룩한 선물로 저희를 구원하소서.',
-        }
-
-        result = update_ppt(ppt_bytes, data)
-        assert isinstance(result, bytes)
-        assert len(result) > 0
-
-    def test_update_ppt_preserves_overall_structure(self):
-        """PPT 전체 구조가 보존되는지 확인."""
-        archive_ppt = Path('archive/261010미사.pptx')
-        if not archive_ppt.exists():
-            pytest.skip("archive PPT 파일이 없습니다")
-
-        with open(archive_ppt, 'rb') as f:
-            original_size = len(f.read())
-
-        with open(archive_ppt, 'rb') as f:
-            ppt_bytes = f.read()
-
-        data = {'date': '2026-10-18'}
-        result = update_ppt(ppt_bytes, data)
-
-        # 수정된 파일이 비슷한 크기여야 함 (±20%)
-        assert 0.8 * original_size < len(result) < 1.2 * original_size
+def test_only_target_runs_change(ppt_1010, fields_1018):
+    out, report = apply_text_fields(ppt_1010, fields_1018)
+    before, after = run_table(ppt_1010), run_table(out)
+    assert before.keys() == after.keys()
+    diffs = {}
+    for key in before:
+        assert before[key][1] == after[key][1], f'서식 변경: {key}'
+        if before[key][0] != after[key][0]:
+            diffs.setdefault(key[0], []).append((before[key][0], after[key][0]))
+    assert {k: sorted(v) for k, v in diffs.items()} == {k: sorted(v) for k, v in EXPECTED_CHANGES.items()}
+    assert report['warnings'] == []
 
 
-class TestAnchorDetection:
-    """앵커 텍스트 탐지 테스트."""
-
-    def test_find_first_lecture_slide(self):
-        """제1독서 슬라이드를 앵커 텍스트로 찾기."""
-        # text_edit.py의 _find_slide_by_anchor 함수 검증
-        # 실제 PPT 파일 필요
-        pass
-
-    def test_find_gospel_acclamation_slide(self):
-        """복음 환호송 슬라이드 찾기."""
-        pass
+def test_gospel_and_title_runs_keep_leading_space(ppt_1010, fields_1018):
+    out, _ = apply_text_fields(ppt_1010, fields_1018)
+    texts = [v[0] for k, v in run_table(out).items() if k[0] == 31]
+    assert ' ✠ 마태오가 전한 거룩한 복음입니다.' in texts
+    assert '복음' in texts
 
 
-if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
+def test_none_value_is_skipped_with_warning(ppt_1010, fields_1018):
+    fields = dict(fields_1018, psalm_refrain=None)
+    out, report = apply_text_fields(ppt_1010, fields)
+    assert any('화답송' in w for w in report['warnings'])
+    t = [v[0] for k, v in run_table(out).items() if k[0] == 28]
+    assert '◎ 저는 오래오래 주님 집에 사오리다.' in t
+
+
+def _with_slide_title_changed(ppt_bytes, slide_no, old, new):
+    pkg = Package(ppt_bytes)
+    part = pkg.slide_parts()[slide_no - 1]
+    root = pkg.xml(part)
+    for t in root.iter(qn('a:t')):
+        if t.text == old:
+            t.text = new
+    pkg.write_xml(part, root)
+    return pkg.save()
+
+
+def test_duplicate_title_slide_is_not_edited(ppt_1010, fields_1018):
+    dup = _with_slide_title_changed(ppt_1010, 30, '복 음 환 호 송', '화답송')
+    out, report = apply_text_fields(dup, fields_1018)
+    assert any('"화답송" 슬라이드가 2개' in w for w in report['warnings'])
+    assert any('"복음환호송" 슬라이드가 0개' in w for w in report['warnings'])
+    before, after = run_table(dup), run_table(out)
+    assert all(before[k] == after[k] for k in before if k[0] in (28, 30))
+
+
+def test_body_word_does_not_make_gospel_slide(ppt_1010):
+    found = find_text_slides(Package(ppt_1010))
+    assert found['복음'] == [31]

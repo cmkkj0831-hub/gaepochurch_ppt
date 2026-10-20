@@ -1,331 +1,200 @@
-"""
-PPT 슬라이드의 텍스트를 수정하는 모듈.
-서식(formatting) 보존이 최우선.
-"""
-import io
+"""PPT 텍스트를 run 단위로만 교체한다. 제목 칸·서식(rPr/pPr)은 건드리지 않는다."""
 import re
-import tempfile
-import zipfile
-from datetime import datetime, timedelta
-from typing import Optional
-from pathlib import Path
 
-from lxml import etree
+from .pptx_package import NS, Package, compact, qn, shape_text, slide_title
 
+TEXT_SLIDE_TITLES = ('제1독서', '화답송', '제2독서', '복음환호송', '복음', '영성체송')
 
-# XML 네임스페이스
-_NAMESPACES = {
-    'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
-    'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
-    'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+FIELD_LABELS = {
+    'cover_title': '표지 제목',
+    'cover_date': '표지 날짜',
+    'first_reading_intro': '제1독서 출처',
+    'first_reading_ref': '제1독서 장절',
+    'psalm_refrain': '화답송',
+    'second_reading_intro': '제2독서 출처',
+    'second_reading_ref': '제2독서 장절',
+    'gospel_acclamation': '복음 환호송',
+    'gospel_intro': '복음 출처',
+    'gospel_ref': '복음 장절',
+    'communion_antiphon': '영성체송',
 }
 
-
-def _format_date_for_title(gomonth_str: Optional[str]) -> str:
-    """
-    URL의 gomonth (YYYY-MM-DD 형식의 주일)에서 토요일 날짜를 "YYYY.MM.DD" 형식으로 변환.
-    """
-    if not gomonth_str:
-        return ""
-
-    try:
-        date_obj = datetime.strptime(gomonth_str, '%Y-%m-%d')
-        # 주일에서 토요일로 (하루 전)
-        saturday = date_obj - timedelta(days=1)
-        return saturday.strftime('%Y.%m.%d')
-    except (ValueError, TypeError):
-        return ""
+DATE_RE = re.compile(r'^\d{4}\.\d{2}\.\d{2}$')
 
 
-def _find_slide_by_anchor(slide_elem, anchor_keywords):
-    """
-    슬라이드 내에서 앵커 텍스트를 포함한 첫 번째 텍스트 프레임을 찾음.
-
-    Args:
-        slide_elem: slide XML 요소
-        anchor_keywords: 검색할 텍스트 리스트 (OR 조건)
-
-    Returns:
-        (shape_elem, text_frame_elem) 튜플, 없으면 (None, None)
-    """
-    namespaces = _NAMESPACES
-
-    # 슬라이드의 모든 도형 탐색
-    for shape in slide_elem.findall('.//p:sp', namespaces):
-        text_body = shape.find('.//p:txBody', namespaces)
-        if text_body is None:
-            continue
-
-        # 이 도형의 모든 텍스트 수집
-        all_text = ''.join(
-            t.text or ''
-            for t in text_body.findall('.//a:t', namespaces)
-        )
-
-        # 앵커 키워드 매칭
-        for keyword in anchor_keywords:
-            if keyword in all_text:
-                return shape, text_body
-
-    return None, None
+def find_text_slides(pkg: Package) -> dict:
+    """제목 칸 텍스트 -> 해당 슬라이드 번호(1부터) 목록."""
+    found = {t: [] for t in TEXT_SLIDE_TITLES}
+    for i, part in enumerate(pkg.slide_parts(), 1):
+        t = slide_title(pkg.xml(part), TEXT_SLIDE_TITLES)
+        if t:
+            found[t].append(i)
+    return found
 
 
-def _update_run_text(run_elem, new_text):
-    """
-    run 요소의 텍스트를 수정 (서식 보존).
-
-    Args:
-        run_elem: <a:r> 요소
-        new_text: 새로운 텍스트
-    """
-    namespaces = _NAMESPACES
-    t_elem = run_elem.find('a:t', namespaces)
-
-    if t_elem is not None:
-        t_elem.text = new_text
-    else:
-        # <a:t> 요소가 없으면 생성
-        t_elem = etree.SubElement(run_elem, '{%s}t' % namespaces['a'])
-        t_elem.text = new_text
+def _run_text(r) -> str:
+    t = r.find('a:t', NS)
+    return (t.text or '') if t is not None else ''
 
 
-def _update_lecture_source(text_body, intro_text, ref_text):
-    """
-    독서/복음의 출처와 장절을 수정.
-
-    독서 형식:
-    - 단락 0: "▥ 이사야서의 말씀입니다." + "25,6-10ㄱ" (두 개의 run)
-
-    Args:
-        text_body: <p:txBody> 요소
-        intro_text: 출처 소개 (예: "▥ 이사야서의 말씀입니다.")
-        ref_text: 장절 (예: "25,6-10ㄱ")
-    """
-    namespaces = _NAMESPACES
-    paragraphs = text_body.findall('.//a:p', namespaces)
-
-    if not paragraphs:
-        return
-
-    first_para = paragraphs[0]
-    runs = first_para.findall('.//a:r', namespaces)
-
-    if not runs:
-        return
-
-    # 첫 번째 run: 소개 텍스트
-    _update_run_text(runs[0], intro_text)
-
-    # 두 번째 run: 장절
-    if len(runs) > 1:
-        _update_run_text(runs[1], ref_text)
-    else:
-        # 두 번째 run이 없으면 생성
-        new_run = etree.Element('{%s}r' % namespaces['a'])
-        # 첫 번째 run의 서식 복사
-        rpr = runs[0].find('a:rPr', namespaces)
-        if rpr is not None:
-            import copy
-            rpr_copy = copy.deepcopy(rpr)
-            new_run.append(rpr_copy)
-
-        t = etree.SubElement(new_run, '{%s}t' % namespaces['a'])
-        t.text = ref_text
-        first_para.append(new_run)
+def _runs(el) -> list:
+    return list(el.iter(qn('a:r')))
 
 
-def _update_single_paragraph(text_body, new_text, para_index=0):
-    """
-    특정 단락의 텍스트를 수정 (모든 run의 텍스트를 하나로 통합).
-
-    Args:
-        text_body: <p:txBody> 요소
-        new_text: 새로운 텍스트
-        para_index: 수정할 단락 인덱스
-    """
-    namespaces = _NAMESPACES
-    paragraphs = text_body.findall('.//a:p', namespaces)
-
-    if para_index >= len(paragraphs):
-        return
-
-    para = paragraphs[para_index]
-    runs = para.findall('.//a:r', namespaces)
-
-    if not runs:
-        return
-
-    # 첫 번째 run에 텍스트 할당
-    _update_run_text(runs[0], new_text)
-
-    # 나머지 run은 빈 텍스트로 설정
-    for run in runs[1:]:
-        _update_run_text(run, '')
+def _next_run_in_paragraph(r):
+    para = r.getparent()
+    runs = para.findall('a:r', NS)
+    idx = runs.index(r)
+    return runs[idx + 1] if idx + 1 < len(runs) else None
 
 
-def update_ppt(ppt_bytes: bytes, data: dict) -> bytes:
-    """
-    PPT를 bytes로 받아 수정 후 bytes로 반환.
+class _Editor:
+    def __init__(self, fields: dict, report: dict):
+        self.fields = fields
+        self.report = report
 
-    Args:
-        ppt_bytes: PPT 파일의 bytes
-        data: 파싱된 전례 정보 (parser.parse_mass_url의 반환값)
+    def value(self, key):
+        v = self.fields.get(key)
+        if v is None or not str(v).strip():
+            self.report['warnings'].append(f'{FIELD_LABELS[key]}: 값이 없어 수정하지 않았습니다.')
+            return None
+        return str(v).strip()
 
-    Returns:
-        수정된 PPT의 bytes
-    """
-    # 임시 폴더에서 작업
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        ppt_path = tmpdir / 'temp.pptx'
+    def set_run(self, r, key, value, slide_no):
+        t = r.find('a:t', NS)
+        old = t.text or ''
+        lead = old[:len(old) - len(old.lstrip())]
+        new = lead + value
+        if new != old:
+            t.text = new
+            self.report['changed'].append(
+                {'slide': slide_no, 'field': FIELD_LABELS[key], 'before': old, 'after': new})
 
-        # bytes를 파일로 저장
-        with open(ppt_path, 'wb') as f:
-            f.write(ppt_bytes)
+    def clear_runs(self, runs):
+        for r in runs:
+            t = r.find('a:t', NS)
+            if t is not None and t.text:
+                t.text = ''
 
-        # PPTX는 ZIP 형식이므로 압축 해제
-        extract_dir = tmpdir / 'extracted'
-        with zipfile.ZipFile(ppt_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_dir)
+    def warn(self, msg):
+        self.report['warnings'].append(msg)
 
-        # slide1.xml 수정 (표지)
-        slide1_path = extract_dir / 'ppt' / 'slides' / 'slide1.xml'
-        if slide1_path.exists():
-            _update_title_slide(slide1_path, data)
 
-        # 나머지 슬라이드들 수정
-        slides_dir = extract_dir / 'ppt' / 'slides'
-        for slide_file in sorted(slides_dir.glob('slide*.xml')):
-            if slide_file.name == 'slide1.xml':
+def _body_shapes(root, exclude):
+    out = []
+    for sp in root.iter(qn('p:sp')):
+        text = compact(shape_text(sp))
+        if text and text not in exclude:
+            out.append(sp)
+    return out
+
+
+def _edit_cover(ed: _Editor, root, slide_no):
+    title_val, date_val = ed.value('cover_title'), ed.value('cover_date')
+    date_runs = [r for r in _runs(root) if DATE_RE.match(_run_text(r).strip())]
+    if date_val is not None:
+        if len(date_runs) == 1:
+            ed.set_run(date_runs[0], 'cover_date', date_val, slide_no)
+        else:
+            ed.warn(f'표지: 날짜 칸을 {len(date_runs)}개 찾아서 수정하지 않았습니다.')
+    if title_val is not None:
+        cands = []
+        for sp in root.iter(qn('p:sp')):
+            text = shape_text(sp).strip()
+            if not text or '개포동성당' in text or DATE_RE.match(text):
                 continue
-            _update_content_slide(slide_file, data)
-
-        # 수정된 파일을 다시 ZIP으로 압축
-        output_ppt = tmpdir / 'output.pptx'
-        with zipfile.ZipFile(output_ppt, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for file_path in extract_dir.rglob('*'):
-                if file_path.is_file():
-                    arcname = file_path.relative_to(extract_dir)
-                    zipf.write(file_path, arcname)
-
-        # bytes로 읽기
-        with open(output_ppt, 'rb') as f:
-            result_bytes = f.read()
-
-        return result_bytes
+            cands.append(sp)
+        if len(cands) != 1:
+            ed.warn(f'표지: 제목 칸을 {len(cands)}개 찾아서 수정하지 않았습니다.')
+            return
+        runs = [r for r in _runs(cands[0]) if _run_text(r)]
+        ed.set_run(runs[0], 'cover_title', title_val, slide_no)
+        ed.clear_runs(runs[1:])
 
 
-def _update_title_slide(slide1_path: Path, data: dict):
-    """
-    슬라이드 1 (표지) 수정.
-    - 제목: 전례일 제목 (숫자 앞뒤 공백 추가)
-    - 날짜: YYYY.MM.DD 형식
-    """
-    tree = etree.parse(str(slide1_path))
-    root = tree.getroot()
-    namespaces = _NAMESPACES
-
-    # 전례일 제목 포맷팅
-    liturgy_title = data.get('liturgy_title')
-    if liturgy_title:
-        # 숫자 앞뒤 공백 추가 (예: "연중 제29주일" → "연중 제 29 주일")
-        formatted_title = re.sub(
-            r'(\D)(\d+)(\D)',
-            r'\1 \2 \3',
-            liturgy_title
-        )
-
-        # 괄호 부분이 있으면 "연중 제 29 주일(전교 주일)" 형식으로
-        # 기존 형식 유지하되 숫자 주변 공백만 추가
-        if '(' in formatted_title:
-            parts = formatted_title.split('(', 1)
-            main_part = parts[0].strip()
-            main_part = re.sub(r'제\s*(\d+)\s*주일', r'제 \1 주일', main_part)
-            formatted_title = f"{main_part}({parts[1]}"
-
-        shape, text_body = _find_slide_by_anchor(
-            root,
-            ['연중 제', '주일']
-        )
-        if shape is not None and text_body is not None:
-            _update_single_paragraph(text_body, formatted_title)
-
-    # 날짜 수정
-    date_str = _format_date_for_title(data.get('date'))
-    if date_str:
-        shape, text_body = _find_slide_by_anchor(root, [date_str.split('.')[2]])  # 일자로 검색
-        if shape is not None and text_body is not None:
-            # 모든 단락을 검색해서 날짜 부분 찾기
-            for para_idx in range(len(text_body.findall('.//a:p', namespaces))):
-                para = text_body.findall('.//a:p', namespaces)[para_idx]
-                para_text = ''.join(
-                    t.text or ''
-                    for t in para.findall('.//a:t', namespaces)
-                )
-                if '202' in para_text or '20' in para_text:  # 날짜처럼 보이는 텍스트
-                    _update_single_paragraph(text_body, date_str, para_idx)
-                    break
-
-    tree.write(str(slide1_path), encoding='utf-8', xml_declaration=True)
+def _runs_starting(root, title, mark, contains=False):
+    out = []
+    for sp in _body_shapes(root, {title}):
+        for r in _runs(sp):
+            text = _run_text(r)
+            if (mark in text) if contains else text.lstrip().startswith(mark):
+                out.append(r)
+    return out
 
 
-def _update_content_slide(slide_path: Path, data: dict):
-    """
-    슬라이드 2-62 수정 (제1독서, 화답송, 제2독서, 복음, 영성체송 등).
-    """
-    tree = etree.parse(str(slide_path))
-    root = tree.getroot()
-    namespaces = _NAMESPACES
+def _edit_source(ed, root, slide_no, title, mark, intro_key, ref_key, contains=False):
+    intro, ref = ed.value(intro_key), ed.value(ref_key)
+    if intro is None and ref is None:
+        return
+    runs = _runs_starting(root, title, mark, contains)
+    if len(runs) != 1:
+        ed.warn(f'{title}: "{mark}" 출처 칸을 {len(runs)}개 찾아서 수정하지 않았습니다.')
+        return
+    if intro is not None:
+        ed.set_run(runs[0], intro_key, intro, slide_no)
+    if ref is not None:
+        nxt = _next_run_in_paragraph(runs[0])
+        if nxt is None or not re.match(r'\d', _run_text(nxt).strip()):
+            ed.warn(f'{title}: 장절 칸을 찾지 못해 장절은 수정하지 않았습니다.')
+        else:
+            ed.set_run(nxt, ref_key, ref, slide_no)
 
-    # 제1독서 (슬라이드 27)
-    if data.get('first_reading_intro') and data.get('first_reading_ref'):
-        shape, text_body = _find_slide_by_anchor(root, ['제1독서', '제 1 독서'])
-        if shape is not None and text_body is not None:
-            _update_lecture_source(
-                text_body,
-                data['first_reading_intro'],
-                data['first_reading_ref']
-            )
 
-    # 화답송 (슬라이드 28)
-    if data.get('responsorial_refrain'):
-        shape, text_body = _find_slide_by_anchor(root, ['화답송'])
-        if shape is not None and text_body is not None:
-            # 화답송은 특정 단락 (후렴 위치) 수정
-            _update_single_paragraph(text_body, data['responsorial_refrain'])
+def _edit_single_mark(ed, root, slide_no, title, mark, key):
+    val = ed.value(key)
+    if val is None:
+        return
+    runs = _runs_starting(root, title, mark)
+    if len(runs) != 1:
+        ed.warn(f'{title}: "{mark}" 칸을 {len(runs)}개 찾아서 수정하지 않았습니다.')
+        return
+    r = runs[0]
+    ed.set_run(r, key, val, slide_no)
+    para_runs = r.getparent().findall('a:r', NS)
+    ed.clear_runs(para_runs[para_runs.index(r) + 1:])
 
-    # 제2독서 (슬라이드 29)
-    if data.get('second_reading_intro') and data.get('second_reading_ref'):
-        shape, text_body = _find_slide_by_anchor(root, ['제2독서', '제 2 독서'])
-        if shape is not None and text_body is not None:
-            _update_lecture_source(
-                text_body,
-                data['second_reading_intro'],
-                data['second_reading_ref']
-            )
 
-    # 복음 환호송 (슬라이드 30)
-    if data.get('gospel_acclamation'):
-        shape, text_body = _find_slide_by_anchor(root, ['복 음 환 호 송', '복음환호송'])
-        if shape is not None and text_body is not None:
-            # 첫 번째 ◎ 찾아서 수정
-            _update_single_paragraph(text_body, '◎ ' + data['gospel_acclamation'])
+def _edit_communion(ed, root, slide_no):
+    val = ed.value('communion_antiphon')
+    if val is None:
+        return
+    bodies = _body_shapes(root, {'영성체송', '영성체예식'})
+    if len(bodies) != 1:
+        ed.warn(f'영성체송: 본문 칸을 {len(bodies)}개 찾아서 수정하지 않았습니다.')
+        return
+    runs = [r for r in _runs(bodies[0]) if _run_text(r)]
+    ed.set_run(runs[0], 'communion_antiphon', val, slide_no)
+    ed.clear_runs(runs[1:])
 
-    # 복음 (슬라이드 31)
-    if data.get('gospel_intro') and data.get('gospel_ref'):
-        shape, text_body = _find_slide_by_anchor(root, ['복음'])
-        if shape is not None and text_body is not None:
-            # 복음은 첫 단락에 출처와 장절
-            _update_lecture_source(
-                text_body,
-                data['gospel_intro'],
-                data['gospel_ref']
-            )
 
-    # 영성체송 (슬라이드 56)
-    if data.get('communion_hymn'):
-        shape, text_body = _find_slide_by_anchor(root, ['영 성 체 송', '영성체송'])
-        if shape is not None and text_body is not None:
-            _update_single_paragraph(text_body, data['communion_hymn'])
+def apply_text_fields(ppt_bytes: bytes, fields: dict):
+    """fields 값으로 표지와 말씀 전례·영성체송 슬라이드의 지정 run만 교체한다."""
+    pkg = Package(ppt_bytes)
+    report = {'changed': [], 'warnings': []}
+    ed = _Editor(fields, report)
+    parts = pkg.slide_parts()
 
-    tree.write(str(slide_path), encoding='utf-8', xml_declaration=True)
+    cover = pkg.xml(parts[0])
+    _edit_cover(ed, cover, 1)
+    pkg.write_xml(parts[0], cover)
+
+    slides = find_text_slides(pkg)
+    edits = {
+        '제1독서': lambda r, n: _edit_source(ed, r, n, '제1독서', '▥', 'first_reading_intro', 'first_reading_ref'),
+        '화답송': lambda r, n: _edit_single_mark(ed, r, n, '화답송', '◎', 'psalm_refrain'),
+        '제2독서': lambda r, n: _edit_source(ed, r, n, '제2독서', '▥', 'second_reading_intro', 'second_reading_ref'),
+        '복음환호송': lambda r, n: _edit_single_mark(ed, r, n, '복음환호송', '○', 'gospel_acclamation'),
+        '복음': lambda r, n: _edit_source(ed, r, n, '복음', '✠', 'gospel_intro', 'gospel_ref', contains=True),
+        '영성체송': lambda r, n: _edit_communion(ed, r, n),
+    }
+    for title, fn in edits.items():
+        nums = slides[title]
+        if len(nums) != 1:
+            report['warnings'].append(f'"{title}" 슬라이드가 {len(nums)}개라서 수정하지 않았습니다.')
+            continue
+        part = parts[nums[0] - 1]
+        root = pkg.xml(part)
+        fn(root, nums[0])
+        pkg.write_xml(part, root)
+
+    return pkg.save(), report
