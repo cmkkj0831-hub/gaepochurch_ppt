@@ -420,23 +420,158 @@ def page_upload_archive():
 
 
 def page_manage_songs():
-    """페이지 3: 성가 관리 (빈 페이지, 4단계에서 구현)."""
+    """페이지 3: 성가 관리 (관리자만 접근)."""
     st.header("🎵 성가 관리", divider="blue")
 
-    st.info("이 페이지는 4단계에서 구현될 예정입니다.")
+    # 비밀번호 인증
+    if 'admin_authenticated' not in st.session_state:
+        st.session_state.admin_authenticated = False
+
+    if not st.session_state.admin_authenticated:
+        st.subheader("🔐 관리자 인증")
+        password = st.text_input("비밀번호", type="password", placeholder="관리자 비밀번호 입력")
+
+        if password:
+            try:
+                admin_password = st.secrets.get('ADMIN_PASSWORD', '')
+                if password == admin_password and admin_password:
+                    st.session_state.admin_authenticated = True
+                    st.success("✅ 인증 완료")
+                    st.rerun()
+                else:
+                    st.error("❌ 비밀번호가 틀렸습니다")
+            except Exception as e:
+                st.error(f"❌ 인증 오류: {str(e)}")
+
+        return
+
+    # 관리자 메뉴
+    st.subheader("성가 관리")
 
     # 현재 저장된 성가 목록
-    st.subheader("현재 저장된 성가")
+    st.subheader("1️⃣ 현재 등록된 성가")
 
     songs = storage.list_songs()
 
     if songs:
-        cols = st.columns(3)
-        for idx, song in enumerate(songs[:12]):  # 최대 12개
-            with cols[idx % 3]:
-                st.caption(song.name)
+        import re
+        # 번호별로 그룹화
+        hymn_dict = {}
+        for song in songs:
+            # 파일명에서 번호 추출 (58.png, 58-1.png 등)
+            match = re.match(r'(\d+)', song.name)
+            if match:
+                hymn_num = int(match.group(1))
+                if hymn_num not in hymn_dict:
+                    hymn_dict[hymn_num] = []
+                hymn_dict[hymn_num].append(song)
+
+        # 번호순으로 정렬
+        for hymn_num in sorted(hymn_dict.keys()):
+            hymn_files = hymn_dict[hymn_num]
+
+            # 섬네일 + 파일 목록
+            cols = st.columns([1, 3, 1])
+
+            with cols[0]:
+                img = storage.read_song(hymn_num)
+                if img:
+                    st.image(Image.open(io.BytesIO(img)), width=80, caption=f"{hymn_num}번")
+
+            with cols[1]:
+                st.write(f"**{hymn_num}번** ({len(hymn_files)}장)")
+                for hf in hymn_files:
+                    st.caption(f"  • {hf.name} ({hf.size/1024:.0f}KB)")
+
+            with cols[2]:
+                if st.button("🗑️", key=f"delete_{hymn_num}", help="삭제"):
+                    if st.checkbox("정말 삭제하시겠습니까?", key=f"confirm_delete_{hymn_num}"):
+                        for hf in hymn_files:
+                            if hasattr(storage, '_delete'):
+                                path = f"songs/{hf.name}"
+                                file_info = storage._get_file(path)
+                                if file_info:
+                                    storage._delete(f"/contents/{path}", {
+                                        "message": f"성가 삭제: {hf.name}",
+                                        "sha": file_info.get('sha'),
+                                        "branch": storage.branch
+                                    })
+                        st.cache_data.clear()
+                        st.success(f"✅ {hymn_num}번 성가 삭제됨")
+                        st.rerun()
     else:
         st.info("저장된 성가 이미지가 없습니다")
+
+    # 새 성가 업로드
+    st.subheader("2️⃣ 새 성가 업로드")
+
+    uploaded_files = st.file_uploader(
+        "이미지 파일 선택 (여러 파일 가능)",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        help="58-1.png, 106-2.jpg 등의 형식으로 업로드"
+    )
+
+    if uploaded_files:
+        import re
+        files_to_upload = []
+
+        for uploaded_file in uploaded_files:
+            filename = uploaded_file.name
+
+            # 파일명에서 번호 추출
+            match = re.match(r'(\d+)(?:-(\d+))?', filename)
+            if match:
+                hymn_num = int(match.group(1))
+                page = int(match.group(2)) if match.group(2) else None
+
+                files_to_upload.append({
+                    'file': uploaded_file,
+                    'hymn_num': hymn_num,
+                    'page': page,
+                    'filename': filename
+                })
+            else:
+                st.warning(f"❌ {filename}: 파일명 형식 인식 실패 (예: 58-1.png)")
+
+        # 업로드 전 확인
+        if files_to_upload:
+            st.write("업로드할 파일:")
+            for item in files_to_upload:
+                page_str = f"-{item['page']}" if item['page'] else ""
+                st.caption(f"  • {item['hymn_num']}{page_str} ({item['file'].name})")
+
+            if st.button("📤 업로드", use_container_width=True, type="primary"):
+                with st.spinner("업로드 중..."):
+                    for item in files_to_upload:
+                        try:
+                            file_content = item['file'].read()
+
+                            # GitHub Storage인 경우
+                            if hasattr(storage, '_put_large_file'):
+                                path = f"songs/{item['filename']}"
+                                message = f"성가 추가: {item['filename']}"
+                                success = storage._put_large_file(path, file_content, message)
+                            else:
+                                # Local Storage인 경우
+                                path = Path(storage.songs_dir) / item['filename']
+                                path.write_bytes(file_content)
+                                success = True
+
+                            if success:
+                                st.success(f"✅ {item['filename']} 업로드됨")
+                        except Exception as e:
+                            st.error(f"❌ {item['filename']}: {str(e)}")
+
+                    # 캐시 비우기
+                    st.cache_data.clear()
+                    st.rerun()
+
+    # 로그아웃
+    st.divider()
+    if st.button("🔓 로그아웃", use_container_width=True):
+        st.session_state.admin_authenticated = False
+        st.rerun()
 
 
 # 메인

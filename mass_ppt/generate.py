@@ -51,7 +51,7 @@ def generate(
     report = {
         'updated_texts': [
             f"제1독서: {parsed.get('first_reading_ref')}",
-            f"화답송: {parsed.get('responsorial_refrain')[:30]}...",
+            f"화답송: {parsed.get('responsorial_refrain')[:30] if parsed.get('responsorial_refrain') else ''}...",
             f"제2독서: {parsed.get('second_reading_ref')}",
             f"복음: {parsed.get('gospel_ref')}",
         ],

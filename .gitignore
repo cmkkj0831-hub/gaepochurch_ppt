@@ -29,3 +29,6 @@ local_*.py
 *token*
 *secret*
 *password*
+
+# 백업 폴더
+archive_backup/

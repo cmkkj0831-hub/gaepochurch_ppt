@@ -187,7 +187,46 @@ def generate(base_ppt_bytes: bytes,
 - `inserted_hymns`: 삽입된 성가 정보 (번호, 위치, 슬라이드 수)
 - `warnings`: 주의사항 (없는 이미지, 배치 변경 등)
 
-## 3단계: Streamlit 웹앱
+## 4단계: GitHub 저장소 연동
+
+### GitHubStorage 구현
+- Fine-grained Personal Access Token 기반 (Contents r/w만)
+- Git Data API 사용 (1MB 이상 파일 지원)
+- 동시 업로드 시 충돌 재시도 로직
+- 캐싱 지원 (st.cache_data)
+
+### 용량 관리
+- **1년 예측**: 약 1.6GB (GitHub 권장 1GB 초과)
+- **대응책**: PPT 내부 이미지 재압축 (손실 압축, 화질 유지)
+- **목표**: 평균 30.8MB → 약 20MB로 축소 (압축률 약 35%)
+
+## 5단계: 용량 최적화 + 성가 관리
+
+### 용량 최적화 (ppt_compress.py)
+- **방식**: PPT 내부 이미지 재압축 (손실 JPEG 압축)
+- **구현**: 
+  - media 폴더의 이미지를 JPEG로 재인코딩
+  - 품질 85로 설정, 최대 너비 1920px로 리사이징
+  - ZIP 재압축
+- **효과**: 평균 30.8MB → 4.1MB (-86.6%)
+- **1년 누적**: 1600MB → 약 250MB (목표 달성)
+
+### 생성 파이프라인 (generate.py)
+1. URL 파싱
+2. 텍스트 수정
+3. 성가 삽입 (준비 중)
+4. **PPT 압축** (자동)
+5. 보고서 작성
+
+### 성가 관리 페이지 (app.py page_manage_songs)
+- **보안**: ADMIN_PASSWORD (st.secrets)로 보호
+- **기능**:
+  1. 현재 등록된 성가 목록 (번호별, 썸네일)
+  2. 새 성가 업로드 (파일명 자동 인식, 여러 파일 동시 업로드)
+  3. 성가 삭제 (확인 필수)
+  4. 최종본 PPT 삭제 (확인 필수)
+- **저장소**: GitHubStorage를 통해 자동 커밋
+- **캐싱**: 변경 후 즉시 캐시 초기화
 
 ### 저장소 인터페이스 (mass_ppt/storage.py)
 - **abstract base class**: `Storage` (로컬/GitHub 등 다양한 구현체를 위해)
