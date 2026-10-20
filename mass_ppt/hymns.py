@@ -1,5 +1,4 @@
 """성가 번호 슬라이드 묶음(입당/봉헌/성체/파견)을 새 성가 이미지로 교체한다."""
-import copy
 import io
 import re
 from typing import Callable, List

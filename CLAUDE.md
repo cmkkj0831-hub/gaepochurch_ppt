@@ -21,10 +21,12 @@ mass_ppt/
   generate.py           text_edit + hymns 통합
   pptx_package.py       PPTX zip 읽기/쓰기 공통 헬퍼 (메모리에서만)
   storage.py            Storage 인터페이스, LocalStorage, GitHubStorage
-archive/                최종본 PPT (원본 불변: 옮기기·이름 바꾸기·내용 변경 금지)
-songs/                  성가 이미지 (원본 불변)
+songs/                  성가 이미지 (원본 불변, 저장소에 있음)
+archive/                로컬 모드용 최종본 폴더 (.gitignore, 저장소에는 없음)
 tests/                  pytest, tests/fixtures/ 에 매일미사 최소 발췌 HTML
+requirements.txt        앱 실행용 (버전 고정), requirements-dev.txt 테스트용
 ```
+- Python 3.13. Streamlit Cloud는 파일이 아니라 배포 화면 Advanced settings에서 Python 버전을 고른다.
 
 ## 파일명 규칙
 - 최종본: `YYMMDD미사.pptx`, 미사가 있는 **토요일** 날짜, 항상 6자리 (예: 261017미사.pptx). "가장 최근 최종본"은 파일명 날짜로 판단.
@@ -33,7 +35,7 @@ tests/                  pytest, tests/fixtures/ 에 매일미사 최소 발췌 H
 ## 공통 원칙
 - **슬라이드는 항상 내용으로 찾는다.** 슬라이드 번호를 고정으로 쓰지 않는다. 슬라이드 순서는 presentation.xml의 sldIdLst 기준(slideN.xml 파일 번호와 다를 수 있음).
 - PPT는 bytes로 받고 bytes로 반환. 디스크에 고정 이름 파일을 쓰지 않는다 (여러 명 동시 사용).
-- 이미지 재압축·자르기 금지. archive/ 원본 수정 금지.
+- 이미지 재압축·자르기 금지. 최종본·성가 원본 내용 수정 금지.
 - 공개 저장소: 토큰·비밀번호·secrets.toml 커밋 금지, 외부 사이트 HTML 전체 커밋 금지(fixture는 필요한 줄만 남긴 최소본).
 
 ## 1. 파서 (mass_ppt/parser.py)
@@ -85,18 +87,28 @@ tests/                  pytest, tests/fixtures/ 에 매일미사 최소 발췌 H
 ## Streamlit 앱 (app.py)
 - `layout="centered"`, 한국어, 한 줄에 하나씩(st.columns 최소화). 사용자 데이터는 st.session_state에만, 생성 파일은 메모리에서 바로 다운로드.
 - PPT 만들기: 기준 PPT(기본 최신 최종본 / 다른 주 선택 / 직접 업로드) → URL 불러오기 → 수정 칸(표지 제목, 표지 날짜, 독서·복음 출처+장절, 화답송, 복음환호송, 영성체송) → 성가 번호(✅/❌ + 장수) → 생성·다운로드(YYMMDD미사.pptx).
-- 최종본 올리기: 구조 점검(성가 묶음, 텍스트 슬라이드, 표지 날짜) 실패 시 경고만 하고 업로드 허용. 표지 날짜로 파일명 제안, 규칙 안 맞으면 저장 불가, 같은 날짜는 덮어쓰기 확인. 삭제 기능 없음.
-- 성가 관리: ADMIN_PASSWORD(st.secrets)로 보호. 다른 페이지는 비밀번호 없음.
+- 최종본 올리기: 구조 점검(성가 묶음, 텍스트 슬라이드, 표지 날짜) 실패 시 경고만 하고 업로드 허용. 표지 날짜로 파일명 제안, 규칙 안 맞으면 저장 불가, 같은 날짜는 덮어쓰기 확인. 이 페이지에는 삭제 기능 없음.
+- 성가 관리: ADMIN_PASSWORD(st.secrets)로 보호. 다른 페이지는 비밀번호 없음. 번호 검색 → 악보·교체·삭제, 새 성가 여러 장 업로드(파일명 인식 실패 시 직접 입력), 최종본 삭제. 삭제는 버튼 → 확인 버튼 2단계(session_state의 pending 값).
+- GitHub 오류(StorageError)는 각 탭에서 한국어로 표시하고 앱은 죽지 않는다.
 
 ## 저장소 (storage.py)
-- secrets에 GITHUB_TOKEN이 있으면 GitHubStorage, 없으면 LocalStorage. 토큰은 st.secrets에서만 읽는다.
-- 커밋 메시지: "최종본: 261017미사.pptx (올린 사람: OOO)", "성가 추가: 58-1.png".
+- secrets에 GITHUB_TOKEN이 있으면 GitHubStorage, 없으면 LocalStorage(로컬 archive/, songs/). 토큰은 st.secrets에서만 읽는다. `get_storage`는 토큰을 캐시 키에 포함해서 토큰이 바뀌면 새로 만든다.
+- **최종본 PPT: GitHub Releases** — 릴리스 하나(태그 `archive`)의 첨부파일.
+  - GitHub 첨부파일 이름에서 한글이 지워지므로 저장 이름은 `YYMMDD_missa.pptx`, 앱에서 보이는 이름은 `YYMMDD미사.pptx`. 올린 사람은 첨부파일 label("올린 사람: OOO")에 저장.
+  - 같은 이름은 지우고 다시 올림(교체). 올린 뒤 파일명 날짜 기준 **최근 12개만 남기고** 나머지 자동 삭제.
+  - 목록·최신본 선택·다운로드 모두 Releases 기준.
+- **성가 이미지: 저장소 songs/** — Git Data API(blob → base_tree로 tree → commit → ref). ref 갱신이 충돌(422)하면 최신 HEAD로 다시 만들어 재시도. 추가·교체·삭제는 `change_songs(add, delete, message)` 한 번의 커밋.
+  - 커밋 메시지: "성가 추가: 58-1.png", "성가 교체: 58", "성가 삭제: 58".
+- 읽기 캐시: 목록은 30초 TTL, 파일 내용은 blob sha·asset id 키(내용이 바뀌면 키가 바뀜). 쓰기 직후 캐시 비움.
+- 오류: 401/403(사용량 한도 제외)은 `GitHubAuthError` — 앱은 "GitHub 연결 오류: 토큰이 만료되었거나 권한이 없습니다. 관리자에게 토큰 갱신을 요청하세요."를 그대로 표시. 그 외 실패도 `StorageError`(한국어)로 올리고, 빈 목록으로 숨기지 않는다.
+- 토큰: Fine-grained, 저장소 gaepochurch_ppt 하나, **Contents: Read and write**만 (Releases 첨부파일도 이 권한으로 동작 확인).
+- **토큰 만료 시 갱신**: GitHub에서 새 Fine-grained 토큰 발급(위 권한) → share.streamlit.io 앱 Settings → Secrets의 `GITHUB_TOKEN` 교체 → 앱 재시작 확인 → 예전 토큰 삭제. (README에도 같은 절차)
 
 ## 용량
-- 최종본 1편 약 31MB → 1년 약 1.6GB로 GitHub 권장(1GB) 초과 예상. 대응책은 **미결정**. (PPT 내부 이미지 재압축은 하지 않는다.)
+- 최종본은 Releases에 최근 12개(약 31MB × 12)만 보관하므로 git 저장소 크기와 무관. 저장소에는 코드와 songs/만 남는다. (이전 커밋 기록에 옛 archive/ PPT가 남아 있지만 기록 정리는 하지 않기로 함.)
 
 ## 테스트
-- `ppt_env/bin/python -m pytest` (오프라인). 파서는 tests/fixtures/의 최소 발췌 HTML로 검증.
+- `MASS_PPT_ARCHIVE_DIR=<최종본 폴더> ppt_env/bin/python -m pytest` (오프라인). 최종본 PPT가 저장소에 없으므로 폴더를 지정하고, 없으면 해당 테스트는 skip. 파서는 tests/fixtures/의 최소 발췌 HTML로 검증. GitHubStorage는 가짜 API로 검증(tests/test_storage.py).
 - 텍스트 수정은 run 단위 전체 diff로 지정 run 외 변화가 없는지 확인.
 - 시각 확인은 LibreOffice로 PDF 변환 후 이미지로 본다(한글 글꼴 대체 필요).
 

@@ -17,18 +17,8 @@ ppt_env/
 .vscode/
 *.iml
 
-# Streamlit secrets
+# 비밀 정보 (secrets.toml.example은 커밋함)
 .streamlit/secrets.toml
-secrets.toml
 
-# 로컬 개발 파일
-.env.local
-local_*.py
-
-# API 토큰, 비밀번호 등
-*token*
-*secret*
-*password*
-
-# 백업 폴더
-archive_backup/
+# 최종본 PPT는 GitHub Releases에 보관 (로컬 모드용 폴더는 커밋하지 않음)
+archive/

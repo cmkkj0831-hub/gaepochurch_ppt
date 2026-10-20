@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -9,16 +10,25 @@ from mass_ppt.storage import LocalStorage
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / 'fixtures'
+# 최종본 PPT는 저장소에 없으므로(Releases 보관) 로컬 폴더를 지정해서 쓴다.
+ARCHIVE_DIR = Path(os.environ.get('MASS_PPT_ARCHIVE_DIR', ROOT / 'archive'))
+
+
+def _archive(name: str) -> bytes:
+    path = ARCHIVE_DIR / name
+    if not path.exists():
+        pytest.skip(f'{path} 없음 (MASS_PPT_ARCHIVE_DIR로 최종본 폴더 지정)')
+    return path.read_bytes()
 
 
 @pytest.fixture(scope='session')
 def ppt_1010() -> bytes:
-    return (ROOT / 'archive' / '261010미사.pptx').read_bytes()
+    return _archive('261010미사.pptx')
 
 
 @pytest.fixture(scope='session')
 def ppt_1017() -> bytes:
-    return (ROOT / 'archive' / '261017미사.pptx').read_bytes()
+    return _archive('261017미사.pptx')
 
 
 @pytest.fixture(scope='session')
@@ -28,7 +38,7 @@ def fields_1018() -> dict:
 
 @pytest.fixture(scope='session')
 def get_images():
-    return LocalStorage(ROOT / 'archive', ROOT / 'songs').get_hymn_images
+    return LocalStorage(ARCHIVE_DIR, ROOT / 'songs').get_hymn_images
 
 
 def run_table(ppt_bytes: bytes) -> dict:

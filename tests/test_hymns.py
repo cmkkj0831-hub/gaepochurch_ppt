@@ -5,7 +5,7 @@ import pytest
 from pptx import Presentation
 
 from mass_ppt.hymns import HymnTemplateError, find_hymn_bundles, hymn_number, place_image, replace_hymns
-from mass_ppt.pptx_package import CONTENT_TYPES, NS, Package, qn, resolve
+from mass_ppt.pptx_package import CONTENT_TYPES, NS, Package, qn
 from mass_ppt.storage import hymn_page_files
 
 FULL = {'entrance': 58, 'offertory': 106, 'communion': [128, 129], 'recessional': 61}
