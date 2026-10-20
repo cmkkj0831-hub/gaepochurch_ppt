@@ -19,13 +19,17 @@ gaepochurch_ppt/
 │   ├── __init__.py
 │   ├── parser.py            # URL 파싱
 │   ├── text_edit.py         # PPT 텍스트 수정
+│   ├── hymns.py             # 성가 이미지 교체
+│   ├── generate.py          # 전체 생성 함수
 │   └── models.py            # 데이터 모델
 ├── songs/                    # 성가 이미지 (수정금지)
 ├── archive/                  # 최종본 PPT (수정금지)
 └── tests/                    # 단위 테스트
     ├── __init__.py
     ├── test_parser.py
-    └── test_text_edit.py
+    ├── test_text_edit.py
+    ├── test_hymns.py
+    └── test_generate.py
 ```
 
 ## 파일명 규칙
@@ -94,8 +98,94 @@ gaepochurch_ppt/
 - 슬라이드 31: 복음
 - 슬라이드 56: 영성체송
 
-## 2단계 추가 규칙 (성가)
-(2단계에서 추가할 예정)
+## 2단계: 성가 이미지 교체 (mass_ppt/hymns.py, mass_ppt/generate.py)
+
+### 성가 번호 슬라이드 정의 (가장 중요)
+- **성가 번호 슬라이드**: 그림 1개 + 숫자만 적힌 텍스트박스 1개로 이루어진 슬라이드
+  - 이 슬라이드만 교체 대상
+  - 그 외 이미지 슬라이드(대영광송, 기도문 등)는 절대 건드리지 않음
+  
+### 성가 배치 위치 (순서 중요)
+성가 번호 슬라이드 묶음은 **순서대로**:
+1. **입당** (Entrance): 첫 번째 묶음
+2. **봉헌** (Offertory): "예물 준비 기도" 앞
+3. **성체** (Communion): "영 성 체 송" 뒤
+4. **파견** (Recessional): 성체 이후
+
+### 성가 슬라이드 교체 규칙
+- **기존 슬라이드 처리**: 기존 묶음 완전히 제거
+- **새 슬라이드 삽입**: 같은 자리에 새 슬라이드 삽입 (한 장당 한 슬라이드)
+- **입력 포맷**: 
+  - 입당: 1개 (예: 58)
+  - 봉헌: 1개 (예: 106)
+  - 성체: 1~2개 (예: 128, 129)
+  - 파견: 1개 (예: 61)
+
+### 이미지 파일명 규칙
+- **형식**: `songs/{번호}-{장}.png` 또는 한 장짜리면 `songs/{번호}.png`
+  - 예: `58-1.png`, `58-2.png`, `128.png`
+- **확장자**: `.png` 또는 `.jpg` 모두 허용
+- **없는 번호**: 이미지 파일이 없으면 슬라이드 삽입 안 하고 경고 목록에 추가
+
+### 슬라이드 배치 규칙 (EMU 좌표)
+슬라이드 기본 크기: 12192000 x 6858000 EMU (10" x 5.625")
+
+**왼쪽 위 번호 텍스트박스**:
+- 위치(offset): (0, 0)
+- 크기(extent): (1567543, 1015663)
+- 포맷: 60pt bold, 가운데 정렬
+- 그림자 효과: 기존 템플릿 그대로 유지
+
+**이미지 영역**:
+- x 좌표: 1567543부터 오른쪽 끝(12192000)까지
+- 비율 유지하며 최대 크기로 맞추기
+- 영역 안에서 가로·세로 가운데 정렬
+- **원본 이미지 자르지 않음** (전체 이미지 표시)
+
+### 슬라이드 복제 방법
+- **템플릿**: 기존 성가 번호 슬라이드 XML 사용
+- **파일 갱신**:
+  - `presentation.xml`의 `sldIdLst` 갱신
+  - `ppt/slides/_rels/*.xml` 관계 파일 갱신
+  - `[Content_Types].xml` 타입 정보 갱신
+  - 고아 media 파일 정리
+
+### 고정 규칙
+**영성체송 슬라이드 배치**:
+- 영성체송 슬라이드는 반드시 영성체 기도문("합당치 않사오나") 슬라이드 바로 다음에 와야 함
+- 성체성가보다 앞에 배치해야 함
+- 어긋나 있으면 자동으로 재배치
+
+### 전체 생성 함수 (mass_ppt/generate.py)
+```python
+def generate(base_ppt_bytes: bytes, 
+             parsed_fields: dict,
+             hymn_numbers: dict,
+             get_hymn_image: callable) -> tuple[bytes, dict]:
+    """
+    PPT 생성.
+    
+    Args:
+        base_ppt_bytes: 템플릿 PPT bytes
+        parsed_fields: parser.parse_mass_url의 결과
+        hymn_numbers: {'entrance': 58, 'offertory': 106, 'communion': [128, 129], 'recessional': 61}
+        get_hymn_image: callable(hymn_number: int) -> bytes | None
+                        성가 번호 → 이미지 bytes (없으면 None)
+    
+    Returns:
+        (result_bytes, report_dict)
+        report: {
+            'updated_texts': [...],
+            'inserted_hymns': [{'num': 58, 'position': 'entrance', 'slides_added': 1}, ...],
+            'warnings': ['Hymn image not found: 999', ...]
+        }
+    """
+```
+
+**report 내용**:
+- `updated_texts`: 변경된 텍스트 항목 리스트
+- `inserted_hymns`: 삽입된 성가 정보 (번호, 위치, 슬라이드 수)
+- `warnings`: 주의사항 (없는 이미지, 배치 변경 등)
 
 ## Git 커밋 규칙
 - Co-Author 포함: `Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>`
