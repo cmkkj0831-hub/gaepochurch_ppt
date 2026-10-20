@@ -12,7 +12,7 @@ import zipfile
 from mass_ppt.parser import parse_mass_url
 from mass_ppt.text_edit import update_ppt
 from mass_ppt.generate import generate_from_local_hymns
-from mass_ppt.storage import LocalStorage
+from mass_ppt.storage import LocalStorage, GitHubStorage, Storage
 from mass_ppt.hymns import _find_hymn_slides
 from lxml import etree
 
@@ -40,7 +40,21 @@ st.markdown("""
 
 # 저장소 초기화
 @st.cache_resource
-def get_storage():
+def get_storage() -> Storage:
+    """GitHub 설정이 있으면 GitHubStorage, 없으면 LocalStorage 사용."""
+    try:
+        # Streamlit secrets에서 GitHub 설정 읽기
+        if hasattr(st, 'secrets') and 'GITHUB_TOKEN' in st.secrets:
+            token = st.secrets.get('GITHUB_TOKEN')
+            repo = st.secrets.get('GITHUB_REPO', 'cmkkj0831-hub/gaepochurch_ppt')
+            branch = st.secrets.get('GITHUB_BRANCH', 'main')
+
+            if token:
+                return GitHubStorage(token, repo, branch)
+    except Exception:
+        pass
+
+    # 기본값: LocalStorage
     return LocalStorage()
 
 storage = get_storage()

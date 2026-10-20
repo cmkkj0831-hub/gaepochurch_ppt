@@ -16,3 +16,16 @@ ppt_env/
 .idea/
 .vscode/
 *.iml
+
+# Streamlit secrets
+.streamlit/secrets.toml
+secrets.toml
+
+# 로컬 개발 파일
+.env.local
+local_*.py
+
+# API 토큰, 비밀번호 등
+*token*
+*secret*
+*password*
